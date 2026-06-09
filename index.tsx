@@ -12,7 +12,7 @@
  *     plaintext.
  */
 
-import definePlugin, { OptionType } from "@utils/types";
+import definePlugin, { OptionType, IconComponent } from "@utils/types";
 import { definePluginSettings } from "@api/Settings";
 import { DataStore } from "@api/index";
 import {
@@ -20,9 +20,12 @@ import {
     removeMessagePreSendListener,
     MessageSendListener,
 } from "@api/MessageEvents";
-import { addChatBarButton, removeChatBarButton, ChatBarButton } from "@api/ChatButtons";
-import { showToast } from "@webpack/common";
-import { FluxDispatcher, ChannelStore, UserStore, React } from "@webpack/common";
+import { ChatBarButton, ChatBarButtonFactory } from "@api/ChatButtons";
+import { updateMessage } from "@api/MessageUpdater";
+import {
+    showToast, Toasts, MessageActions,
+    FluxDispatcher, ChannelStore, UserStore, React,
+} from "@webpack/common";
 import { Logger } from "@utils/Logger";
 
 import {
@@ -65,6 +68,30 @@ const enabledChannels = new Set<string>();
  * so a client restart can't replay them either.
  */
 const processedHandshakeMsgs = new Set<string>();
+
+/**
+ * Plaintext of our own outgoing encrypted messages, keyed by the exact wire
+ * string we sent. We can't decrypt our own ciphertext (the ratchet only moves
+ * forward), and at pre-send time the message has no ID yet — so we stash the
+ * plaintext here and move it into `decryptedCache` (keyed by the real message
+ * ID) when the server echoes our message back via MESSAGE_CREATE. Without
+ * this, your own messages would render as an "[encrypted]" placeholder
+ * forever. Not persisted: it only needs to survive the send → echo window.
+ */
+const pendingOwnPlaintext = new Map<string, string>();
+const MAX_PENDING_OWN = 200;
+
+/** Cap so the persisted plaintext cache can't grow without bound.
+ *  Maps iterate in insertion order, so this evicts the oldest entries. */
+const MAX_DECRYPTED_CACHE = 5000;
+function cacheDecrypted(messageId: string, plaintext: string) {
+    decryptedCache.set(messageId, plaintext);
+    while (decryptedCache.size > MAX_DECRYPTED_CACHE) {
+        const oldest = decryptedCache.keys().next().value;
+        if (oldest === undefined) break;
+        decryptedCache.delete(oldest);
+    }
+}
 
 // React subscribers that want to re-render when E2EE state changes.
 // `sessions` and `enabledChannels` are plain module-level mutables, invisible
@@ -166,21 +193,14 @@ const onSend: MessageSendListener = async (channelId, msg) => {
         await persistSessions();
         notifyStateChange();
         msg.content = wire;
-        showToast(
-            "🔐 E2EE handshake sent. Your message wasn't sent — please retype it after the lock turns green.",
-            "OK", () => Notices.popNotice()
-        );
+        showToast("🔐 E2EE handshake sent. Your message wasn't sent — please retype it after the lock turns green.");
         return;
     }
 
     if (s.phase === "init-sent") {
         // Still waiting on the peer's ACK. Refuse to send plaintext.
-        msg.content = "";
-        showToast(
-            "🔐 E2EE handshake still in progress. Wait for the lock to turn green.",
-            "OK", () => Notices.popNotice()
-        );
-        return;
+        showToast("🔐 E2EE handshake still in progress. Wait for the lock to turn green.");
+        return { cancel: true };
     }
 
     if (s.phase === "init-recvd") {
@@ -191,11 +211,10 @@ const onSend: MessageSendListener = async (channelId, msg) => {
         // it would otherwise be sent in plaintext alongside the handshake.
         if (!s.peerIdPub || !s.peerEphPub) {
             log.error("init-recvd phase missing peer keys", channelId);
-            msg.content = "";
             sessions.delete(channelId);
             await persistSessions();
             notifyStateChange();
-            return;
+            return { cancel: true };
         }
         try {
             const { wire, session: newSession } = await buildAck(
@@ -205,28 +224,47 @@ const onSend: MessageSendListener = async (channelId, msg) => {
             await persistSessions();
             notifyStateChange();
             msg.content = wire;
+            const safety = settings.store.showSafetyNumberOnReady
+                ? ` Safety #: ${newSession.safetyNum}.`
+                : "";
             showToast(
-                `🔐 E2EE handshake accepted. Safety #: ${newSession.safetyNum}. ` +
+                `🔐 E2EE handshake accepted.${safety} ` +
                 "Your message wasn't sent — please retype it after the lock turns green.",
-                "OK", () => Notices.popNotice()
+                Toasts.Type.SUCCESS
             );
         } catch (e) {
             log.error("Failed to build ACK", e);
-            showToast("🔐 Handshake failed; aborting send.", "OK", () => Notices.popNotice());
-            msg.content = "";
+            showToast("🔐 Handshake failed; aborting send.", Toasts.Type.FAILURE);
+            return { cancel: true };
         }
         return;
     }
 
     // Phase === "ready" — encrypt.
     try {
-        const wire = await encryptForSession(s, msg.content);
+        const plaintext = msg.content;
+        const wire = await encryptForSession(s, plaintext);
         msg.content = wire;
+        // Remember our own plaintext so the echoed message renders readably.
+        pendingOwnPlaintext.set(wire, plaintext);
+        while (pendingOwnPlaintext.size > MAX_PENDING_OWN) {
+            const oldest = pendingOwnPlaintext.keys().next().value;
+            if (oldest === undefined) break;
+            pendingOwnPlaintext.delete(oldest);
+        }
         await persistSessions();    // ratchet state advances on every send
     } catch (e) {
         log.error("Encrypt failed", e);
-        showToast("🔐 Encryption failed; aborting send.", "OK", () => Notices.popNotice());
-        msg.content = "";
+        // As the handshake responder we cannot send until the peer's first
+        // encrypted message arrives and primes our sending chain (the peer's
+        // client sends one automatically on ACK receipt).
+        showToast(
+            String(e).includes("no sending chain")
+                ? "🔐 Waiting for the peer's first encrypted message — try again in a moment."
+                : "🔐 Encryption failed; aborting send.",
+            Toasts.Type.FAILURE
+        );
+        return { cancel: true };
     }
 };
 
@@ -242,8 +280,13 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
 
     // Don't try to "decrypt" our own outgoing handshake / ciphertext (we
     // produced it, and our session state for sending is already advanced).
+    // If we can't tell who authored the message (MESSAGE_UPDATE payloads may
+    // omit `author`), bail rather than risk feeding our OWN ciphertext into
+    // the ratchet — its unknown header pubkey would trigger a bogus DH
+    // ratchet and wreck the session.
     const me = UserStore.getCurrentUser();
-    const fromSelf = message.author?.id === me?.id;
+    if (!me?.id || !message.author?.id) return;
+    const fromSelf = message.author.id === me.id;
 
     // For handshake messages (INIT / ACK / RESET) we de-dupe by message ID:
     // any given handshake message must take its state-mutating effect at most
@@ -260,14 +303,14 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
         if (content.startsWith(PREFIX_INIT)) {
             if (fromSelf) {
                 // Our own outgoing INIT — purely cosmetic on render.
-                replaceContent(message, "🔐 [E2EE handshake invitation sent]");
+                replaceContent(channelId, message, "🔐 [E2EE handshake invitation sent]");
                 await markProcessed(message.id);
                 return;
             }
             if (alreadyProcessed) {
                 // Old INIT loaded from history; we already acted on it (or
                 // explicitly decided not to). Render but do NOT mutate state.
-                replaceContent(message, "🔐 [E2EE handshake invitation — historic]");
+                replaceContent(channelId, message, "🔐 [E2EE handshake invitation — historic]");
                 return;
             }
 
@@ -287,11 +330,10 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
                     current.phase === "ready"     ? "secure channel already active" :
                     current.phase === "init-sent" ? "outgoing handshake in flight"  :
                     /* init-recvd */                "another invitation already pending";
-                replaceContent(message, `🔐 [E2EE handshake invitation ignored — ${reason}]`);
+                replaceContent(channelId, message, `🔐 [E2EE handshake invitation ignored — ${reason}]`);
                 showToast(
                     `🔐 Peer sent a handshake invitation, but ${reason}. ` +
-                    "Toggle the lock off and on to reset if you want to accept it.",
-                    "OK", () => Notices.popNotice()
+                    "Toggle the lock off and on to reset if you want to accept it."
                 );
                 await markProcessed(message.id);
                 return;
@@ -313,13 +355,12 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
             await persistSessions();
             notifyStateChange();
             replaceContent(
-                message,
+                channelId, message,
                 "🔐 [E2EE handshake invitation — enable the lock and send a message to accept]"
             );
             showToast(
                 "🔐 Peer wants to start a secure channel. Click the lock " +
-                "and send a message to accept (or ignore to decline).",
-                "OK", () => Notices.popNotice()
+                "and send a message to accept (or ignore to decline)."
             );
             await markProcessed(message.id);
             return;
@@ -327,30 +368,49 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
 
         if (content.startsWith(PREFIX_ACK)) {
             if (fromSelf) {
-                replaceContent(message, "🔐 [E2EE handshake response sent]");
+                replaceContent(channelId, message, "🔐 [E2EE handshake response sent]");
                 await markProcessed(message.id);
                 return;
             }
             if (alreadyProcessed) {
-                replaceContent(message, "🔐 [E2EE handshake response — historic]");
+                replaceContent(channelId, message, "🔐 [E2EE handshake response — historic]");
                 return;
             }
             const s = sessions.get(channelId);
             if (!s || s.phase !== "init-sent" || !s.pendingEph) {
                 log.warn("Got ACK with no pending init for channel", channelId);
-                replaceContent(message, "🔐 [unexpected E2EE ACK]");
+                replaceContent(channelId, message, "🔐 [unexpected E2EE ACK]");
                 await markProcessed(message.id);
                 return;
             }
             const newSession = await handleAck(identity, s.pendingEph, content);
             sessions.set(channelId, newSession);
+
+            // Prime the responder's sending chain. By Double Ratchet design
+            // the responder (Bob) has no sending chain until our first
+            // encrypted message reaches him and triggers his DH ratchet — so
+            // until we send something, ALL of his sends would fail. Send one
+            // encrypted message automatically so both sides can talk
+            // immediately. It decrypts to a visible "channel established"
+            // note on his end.
+            try {
+                const primeText = "🔐 Secure channel established.";
+                const primeWire = await encryptForSession(newSession, primeText);
+                pendingOwnPlaintext.set(primeWire, primeText);
+                sendRaw(channelId, primeWire);
+            } catch (e) {
+                log.error("Failed to send priming message", e);
+            }
+
             await persistSessions();
             notifyStateChange();
-            replaceContent(message, "🔐 E2EE secure channel established.");
-            showToast(
-                `🔐 Secure channel established. Safety #: ${newSession.safetyNum}`,
-                "OK", () => Notices.popNotice()
-            );
+            replaceContent(channelId, message, "🔐 E2EE secure channel established.");
+            if (settings.store.showSafetyNumberOnReady) {
+                showToast(
+                    `🔐 Secure channel established. Safety #: ${newSession.safetyNum}`,
+                    Toasts.Type.SUCCESS
+                );
+            }
             await markProcessed(message.id);
             return;
         }
@@ -360,18 +420,18 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
             // happily wipe an active session if it ever re-saw our OWN past
             // RESET during a history load.
             if (fromSelf) {
-                replaceContent(message, "🔐 [E2EE reset sent]");
+                replaceContent(channelId, message, "🔐 [E2EE reset sent]");
                 await markProcessed(message.id);
                 return;
             }
             if (alreadyProcessed) {
-                replaceContent(message, "🔐 [E2EE reset — historic]");
+                replaceContent(channelId, message, "🔐 [E2EE reset — historic]");
                 return;
             }
             sessions.delete(channelId);
             await persistSessions();
             notifyStateChange();
-            replaceContent(message, "🔐 Peer reset the secure channel.");
+            replaceContent(channelId, message, "🔐 Peer reset the secure channel.");
             await markProcessed(message.id);
             return;
         }
@@ -379,59 +439,74 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
         if (content.startsWith(PREFIX_MSG)) {
             // Already decrypted before? (e.g. message was re-loaded)
             if (decryptedCache.has(message.id)) {
-                replaceContent(message, decryptedCache.get(message.id)!);
+                replaceContent(channelId, message, decryptedCache.get(message.id)!);
                 return;
             }
 
             // Our own outgoing ciphertext: we can't decrypt it (forward secrecy
-            // moves the ratchet forward), but we don't need to — we already
-            // saw the plaintext when we typed it. Show a placeholder.
+            // moves the ratchet forward), but we don't need to — we stashed the
+            // plaintext at send time. Promote it into the persistent cache now
+            // that we know the message ID. Falls back to a placeholder for
+            // messages sent before this client session (or from another device).
             if (fromSelf) {
-                replaceContent(message, "🔐 [encrypted — sent]");
+                const pt = pendingOwnPlaintext.get(content);
+                if (pt !== undefined) {
+                    pendingOwnPlaintext.delete(content);
+                    cacheDecrypted(message.id, pt);
+                    await persistDecrypted();
+                    replaceContent(channelId, message, pt);
+                } else {
+                    replaceContent(channelId, message, "🔐 [encrypted — sent]");
+                }
                 return;
             }
 
             const s = sessions.get(channelId);
             if (!s || s.phase !== "ready") {
-                replaceContent(message, "🔐 [no session — cannot decrypt]");
+                replaceContent(channelId, message, "🔐 [no session — cannot decrypt]");
                 return;
             }
             const plaintext = await decryptForSession(s, content);
-            decryptedCache.set(message.id, plaintext);
+            cacheDecrypted(message.id, plaintext);
             await persistDecrypted();
             await persistSessions();
-            replaceContent(message, plaintext);
+            replaceContent(channelId, message, plaintext);
         }
     } catch (e) {
         log.error("Failed to handle incoming E2EE message", e);
-        replaceContent(message, "🔐 [decryption failed]");
+        // Mark broken handshake messages processed so history loads don't
+        // retry (and re-fail) them forever.
+        if (isHandshake) await markProcessed(message.id).catch(() => { });
+        replaceContent(
+            channelId, message,
+            isHandshake ? "🔐 [invalid E2EE handshake message]" : "🔐 [decryption failed]"
+        );
     }
 }
 
-/** Mutate a Discord message object so the renderer shows our text instead of
- *  the raw cipher. We patch both .content and the parsed content array if the
- *  store has already parsed it. */
-function replaceContent(message: any, newContent: string) {
+/** Make the renderer show our text instead of the raw cipher.
+ *
+ *  Mutating the Flux payload alone is NOT enough: MessageStore converts the
+ *  payload into an immutable MessageRecord synchronously during dispatch, and
+ *  this code runs async — after the store already took its copy. So we also
+ *  go through the MessageUpdater API, which merges new fields into the cached
+ *  record and forces a re-render. The payload mutation is kept as a cheap
+ *  belt-and-suspenders for any consumer that reads the raw payload later. */
+function replaceContent(channelId: string, message: any, newContent: string) {
     message.content = newContent;
-    // Force re-parse: clear any pre-parsed structure so Discord re-runs its
-    // markdown / mention parser on our new content.
     if ("contentParsed" in message) delete message.contentParsed;
     if ("embeds" in message && Array.isArray(message.embeds)) message.embeds = [];
+    if (message.id) updateMessage(channelId, message.id, { content: newContent });
 }
 
-/** Send a raw text message bypassing our pre-send listener. We do this by
- *  dispatching directly through Discord's MessageActions. */
-async function sendRaw(channelId: string, content: string) {
-    // Dynamic import to avoid Vencord's lazy-require complaining at load time.
-    const MessageActions = (await import("@webpack/common")).MessageActions
-        ?? (window as any).webpackChunkdiscord_app /* fallback */;
+/** Send a raw text message bypassing our pre-send listener. The content
+ *  starts with an E2EE prefix, which `isE2EEMessage` already short-circuits
+ *  on, so onSend won't try to (re-)encrypt it. */
+function sendRaw(channelId: string, content: string) {
     if (!MessageActions?.sendMessage) {
-        log.error("MessageActions.sendMessage unavailable; cannot auto-send ACK");
+        log.error("MessageActions.sendMessage unavailable; cannot auto-send message");
         return;
     }
-    // We mark this content with a hidden flag the listener checks for so it
-    // doesn't try to encrypt it. The marker is just the E2EE prefix itself,
-    // which `isE2EEMessage` already short-circuits on.
     MessageActions.sendMessage(channelId, { content, invalidEmojis: [], tts: false, validNonShortcutEmojis: [] });
 }
 
@@ -440,18 +515,43 @@ function isDM(ch: any): boolean {
     return ch?.type === 1;
 }
 
+/**
+ * Serialize all incoming-message processing per channel. handleIncoming
+ * awaits crypto ops while mutating shared session state; if a LOAD batch (or
+ * a LOAD racing a MESSAGE_CREATE) ran concurrently, two decrypts could read
+ * the same chain key and derive wrong message keys or clobber counters.
+ */
+const channelQueues = new Map<string, Promise<void>>();
+function enqueueIncoming(channelId: string, message: any) {
+    const prev = channelQueues.get(channelId) ?? Promise.resolve();
+    const next = prev
+        .then(() => handleIncoming(channelId, message))
+        .catch(err => log.error("Failed to handle incoming message", err));
+    channelQueues.set(channelId, next);
+}
+
 // ------------------------------ FluxDispatcher subscriptions ------------------------------
 
 const fluxHandlers: Array<[string, (e: any) => void]> = [];
 
-function subscribe<T extends { type: string }>(name: string, fn: (e: T) => void) {
+function subscribe<T>(name: string, fn: (e: T) => void) {
     FluxDispatcher.subscribe(name as any, fn as any);
     fluxHandlers.push([name, fn as any]);
 }
 
 // ------------------------------ Lock toggle button ------------------------------
 
-const LockButton: ChatBarButton = ({ channel, isMainChat }) => {
+/** Padlock icon shown for this plugin in the chat-button settings UI. */
+const LockIcon: IconComponent = ({ height = 20, width = 20, className }) => (
+    <svg width={width} height={height} viewBox="0 0 24 24" className={className}>
+        <path
+            fill="currentColor"
+            d="M12 1a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2h-1V6a5 5 0 0 0-5-5Zm-3 8V6a3 3 0 1 1 6 0v3H9Z"
+        />
+    </svg>
+);
+
+const LockButton: ChatBarButtonFactory = ({ channel, isMainChat }) => {
     if (!isMainChat) return null;            // skip forwarding modal etc.
     if (!channel || !isDM(channel)) return null;
 
@@ -504,12 +604,11 @@ async function onLockClicked(channelId: string) {
         await persistEnabled();
         await persistSessions();
         notifyStateChange();
-        if (had) await sendRaw(channelId, PREFIX_RESET);
+        if (had) sendRaw(channelId, PREFIX_RESET);
         showToast(
             pending?.phase === "init-recvd"
                 ? "🔐 Handshake invitation declined."
-                : "🔐 E2EE disabled for this DM.",
-            "OK", () => Notices.popNotice()
+                : "🔐 E2EE disabled for this DM."
         );
     } else {
         enabledChannels.add(channelId);
@@ -518,7 +617,7 @@ async function onLockClicked(channelId: string) {
         const msg = pending?.phase === "init-recvd"
             ? "🔐 E2EE enabled. Send a message to accept the peer's handshake (your first message will not be delivered — retype it after the lock turns green)."
             : "🔐 E2EE enabled. Send a message to start the handshake (your first message will not be delivered — retype it after the lock turns green).";
-        showToast(msg, "OK", () => Notices.popNotice());
+        showToast(msg);
     }
 }
 
@@ -543,8 +642,14 @@ export default definePlugin({
             id: 1496025810870472744n
         }
     ],
-    dependencies: ["ChatInputButtonAPI", "MessageEventsAPI"],
+    dependencies: ["ChatInputButtonAPI", "MessageEventsAPI", "MessageUpdaterAPI"],
     settings,
+
+    // Registered/unregistered automatically by the PluginManager.
+    chatBarButton: {
+        icon: LockIcon,
+        render: LockButton,
+    },
 
     async start() {
         await loadAll();
@@ -552,28 +657,31 @@ export default definePlugin({
         // Outgoing.
         addMessagePreSendListener(onSend);
 
-        // Incoming via Flux.
+        // Incoming via Flux. All paths go through the per-channel queue so
+        // ratchet operations on one session never interleave.
         const onCreate = (e: { channelId: string; message: any }) => {
-            handleIncoming(e.channelId, e.message).catch(err => log.error(err));
+            enqueueIncoming(e.channelId, e.message);
         };
         subscribe("MESSAGE_CREATE", onCreate);
 
-        // Bulk loads (history scrollback / channel switch).
+        // Bulk loads (history scrollback / channel switch). Discord delivers
+        // these newest-first; process oldest-first so the ratchet mostly
+        // advances in order instead of leaning on skipped-key handling.
         const onLoad = (e: { channelId: string; messages: any[] }) => {
-            for (const m of e.messages ?? []) {
-                handleIncoming(e.channelId, m).catch(err => log.error(err));
-            }
+            const msgs = [...(e.messages ?? [])].sort((a, b) =>
+                a.id?.length !== b.id?.length
+                    ? a.id?.length - b.id?.length        // snowflakes: shorter id == older
+                    : a.id < b.id ? -1 : 1
+            );
+            for (const m of msgs) enqueueIncoming(e.channelId, m);
         };
         subscribe("LOAD_MESSAGES_SUCCESS", onLoad);
 
         // Edits: re-decrypt if the cached ciphertext changed somehow (shouldn't).
         subscribe("MESSAGE_UPDATE", (e: { message: any }) => {
             if (!e.message?.channel_id) return;
-            handleIncoming(e.message.channel_id, e.message).catch(err => log.error(err));
+            enqueueIncoming(e.message.channel_id, e.message);
         });
-
-        // Lock button on the chat bar.
-        addChatBarButton("E2EE", LockButton);
 
         log.info("E2EE plugin started");
     },
@@ -582,7 +690,6 @@ export default definePlugin({
         removeMessagePreSendListener(onSend);
         for (const [name, fn] of fluxHandlers) FluxDispatcher.unsubscribe(name as any, fn as any);
         fluxHandlers.length = 0;
-        removeChatBarButton("E2EE");
         log.info("E2EE plugin stopped");
     },
 });
