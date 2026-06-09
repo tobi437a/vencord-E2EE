@@ -69,16 +69,16 @@ export async function generateDH(): Promise<KeyPair> {
 
 /** ECDH: returns 32-byte shared secret. */
 export async function dh(priv: CryptoKey, peerPub: Uint8Array): Promise<Uint8Array> {
-    const peer = await crypto.subtle.importKey("raw", peerPub, X25519, true, []);
+    const peer = await crypto.subtle.importKey("raw", peerPub as BufferSource, X25519, true, []);
     const bits = await crypto.subtle.deriveBits({ name: "X25519", public: peer } as any, priv, 256);
     return new Uint8Array(bits);
 }
 
 /** HKDF-SHA256 expand to `length` bytes. */
 export async function hkdf(ikm: Uint8Array, salt: Uint8Array, info: Uint8Array, length: number): Promise<Uint8Array> {
-    const key = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
+    const key = await crypto.subtle.importKey("raw", ikm as BufferSource, "HKDF", false, ["deriveBits"]);
     const bits = await crypto.subtle.deriveBits(
-        { name: "HKDF", hash: "SHA-256", salt, info },
+        { name: "HKDF", hash: "SHA-256", salt: salt as BufferSource, info: info as BufferSource },
         key, length * 8
     );
     return new Uint8Array(bits);
@@ -87,11 +87,11 @@ export async function hkdf(ikm: Uint8Array, salt: Uint8Array, info: Uint8Array, 
 /** HMAC-SHA256. */
 async function hmac(keyBytes: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
     const k = await crypto.subtle.importKey(
-        "raw", keyBytes,
+        "raw", keyBytes as BufferSource,
         { name: "HMAC", hash: "SHA-256" },
         false, ["sign"]
     );
-    return new Uint8Array(await crypto.subtle.sign("HMAC", k, data));
+    return new Uint8Array(await crypto.subtle.sign("HMAC", k, data as BufferSource));
 }
 
 /** Persist/restore X25519 private keys via JWK (the only currently-portable way). */
@@ -124,17 +124,23 @@ export async function kdfCK(ck: Uint8Array): Promise<{ ck: Uint8Array; mk: Uint8
  *  via HKDF, so the same MK is never reused with the same IV (each MK is one-shot). */
 export async function aeadEncrypt(mk: Uint8Array, plaintext: Uint8Array, ad: Uint8Array): Promise<Uint8Array> {
     const expanded = await hkdf(mk, new Uint8Array(32), utf8("vencord-e2ee/aead"), 44);
-    const aesKey = await crypto.subtle.importKey("raw", expanded.slice(0, 32), "AES-GCM", false, ["encrypt"]);
+    const aesKey = await crypto.subtle.importKey("raw", expanded.slice(0, 32) as BufferSource, "AES-GCM", false, ["encrypt"]);
     const iv = expanded.slice(32, 44);
-    const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: ad }, aesKey, plaintext);
+    const ct = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv, additionalData: ad as BufferSource },
+        aesKey, plaintext as BufferSource
+    );
     return new Uint8Array(ct);
 }
 
 export async function aeadDecrypt(mk: Uint8Array, ciphertext: Uint8Array, ad: Uint8Array): Promise<Uint8Array> {
     const expanded = await hkdf(mk, new Uint8Array(32), utf8("vencord-e2ee/aead"), 44);
-    const aesKey = await crypto.subtle.importKey("raw", expanded.slice(0, 32), "AES-GCM", false, ["decrypt"]);
+    const aesKey = await crypto.subtle.importKey("raw", expanded.slice(0, 32) as BufferSource, "AES-GCM", false, ["decrypt"]);
     const iv = expanded.slice(32, 44);
-    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: ad }, aesKey, ciphertext);
+    const pt = await crypto.subtle.decrypt(
+        { name: "AES-GCM", iv, additionalData: ad as BufferSource },
+        aesKey, ciphertext as BufferSource
+    );
     return new Uint8Array(pt);
 }
 
@@ -220,35 +226,49 @@ export async function ratchetEncrypt(s: RatchetState, plaintext: Uint8Array, ad:
     return concat(headerBytes, ct);
 }
 
-/** Decrypt one message. Mutates state. */
+/** Decrypt one message. Mutates state ONLY if decryption succeeds.
+ *
+ *  All ratchet steps are performed on a working copy and committed back to `s`
+ *  only after the AEAD authenticates the message. Otherwise a single
+ *  corrupted/forged message (whose header would trigger a bogus DH ratchet or
+ *  chain advance) would permanently desync the live session. This mirrors the
+ *  Signal spec's requirement that failed decryptions leave state untouched. */
 export async function ratchetDecrypt(s: RatchetState, msg: Uint8Array, ad: Uint8Array): Promise<Uint8Array> {
     const headerBytes = msg.slice(0, 40);
     const ct = msg.slice(40);
     const h = parseHeader(headerBytes);
 
+    // Working copy. Shallow spread is enough: all mutations replace fields /
+    // map entries, never write into the underlying byte arrays or KeyPair.
+    const c: RatchetState = { ...s, skipped: { ...s.skipped } };
+
     // 1. Try a skipped message key first (out-of-order delivery).
     const skipKey = b64encode(h.dh) + ":" + h.n;
-    if (s.skipped[skipKey]) {
-        const mk = s.skipped[skipKey];
-        delete s.skipped[skipKey];
-        return aeadDecrypt(mk, ct, concat(ad, headerBytes));
+    if (c.skipped[skipKey]) {
+        const mk = c.skipped[skipKey];
+        delete c.skipped[skipKey];
+        const pt = await aeadDecrypt(mk, ct, concat(ad, headerBytes));
+        Object.assign(s, c);    // commit (consume the skipped key) only on success
+        return pt;
     }
 
     // 2. New ratchet pubkey from peer? Skip rest of old chain, then DH-ratchet.
-    if (!s.DHr || !bytesEqual(h.dh, s.DHr)) {
-        await skipMessageKeys(s, h.pn);
-        await dhRatchet(s, h.dh);
+    if (!c.DHr || !bytesEqual(h.dh, c.DHr)) {
+        await skipMessageKeys(c, h.pn);
+        await dhRatchet(c, h.dh);
     }
 
     // 3. Skip any earlier messages in the current receive chain.
-    await skipMessageKeys(s, h.n);
+    await skipMessageKeys(c, h.n);
 
     // 4. Advance receive chain by one and decrypt.
-    if (!s.CKr) throw new Error("no receive chain");
-    const { ck: nextCK, mk } = await kdfCK(s.CKr);
-    s.CKr = nextCK;
-    s.Nr += 1;
-    return aeadDecrypt(mk, ct, concat(ad, headerBytes));
+    if (!c.CKr) throw new Error("no receive chain");
+    const { ck: nextCK, mk } = await kdfCK(c.CKr);
+    c.CKr = nextCK;
+    c.Nr += 1;
+    const pt = await aeadDecrypt(mk, ct, concat(ad, headerBytes));
+    Object.assign(s, c);
+    return pt;
 }
 
 async function skipMessageKeys(s: RatchetState, until: number): Promise<void> {
@@ -260,6 +280,11 @@ async function skipMessageKeys(s: RatchetState, until: number): Promise<void> {
         if (s.DHr) s.skipped[b64encode(s.DHr) + ":" + s.Nr] = mk;
         s.Nr += 1;
     }
+    // MAX_SKIP bounds one call, but the map accumulates across DH ratchets.
+    // Evict oldest entries (string-keyed Records preserve insertion order) so
+    // the total stays bounded, per the spec's "delete old skipped keys" advice.
+    const keys = Object.keys(s.skipped);
+    for (let i = 0; i < keys.length - MAX_SKIP; i++) delete s.skipped[keys[i]];
 }
 
 async function dhRatchet(s: RatchetState, peerNewDH: Uint8Array): Promise<void> {
@@ -353,7 +378,7 @@ export async function safetyNumber(idA: Uint8Array, idB: Uint8Array): Promise<st
     // Order-independent: sort by raw bytes.
     const [lo, hi] = compareBytes(idA, idB) < 0 ? [idA, idB] : [idB, idA];
     const digest = new Uint8Array(
-        await crypto.subtle.digest("SHA-256", concat(lo, hi))
+        await crypto.subtle.digest("SHA-256", concat(lo, hi) as BufferSource)
     );
     // Take 30 decimal digits from first 15 bytes.
     let out = "";
