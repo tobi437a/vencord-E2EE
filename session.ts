@@ -184,8 +184,8 @@ export async function buildAck(
     const myEph = await generateDH();
 
     // Triple-DH (Bob's perspective):
-    //   dh1 = DH(myEph, peerId)      [== Alice DH(Eph, IdB) on her side]
-    //   dh2 = DH(myId,  peerEph)     [== Alice DH(Id, EphB)]
+    //   dh1 = DH(myEph, peerId)      [== Alice DH(IdA, EphB) on her side]
+    //   dh2 = DH(myId,  peerEph)     [== Alice DH(EphA, IdB)]
     //   dh3 = DH(myEph, peerEph)
     //   dh4 = DH(myId,  peerId)
     const dh1 = await dh(myEph.privateKey,    peerIdPub);
@@ -194,16 +194,14 @@ export async function buildAck(
     const dh4 = await dh(id.privateKey,       peerIdPub);
 
     // IMPORTANT: Both sides must mix the four DH outputs in the same order.
-    // From Alice's perspective the equivalent ordering is:
-    //   dh1 = DH(myId,  peerEph)   == our dh2
-    //   dh2 = DH(myEph, peerId)    == our dh1
-    //   dh3 = DH(myEph, peerEph)   == our dh3
-    //   dh4 = DH(myId,  peerId)    == our dh4
-    // So canonical order is: (DH involving initiator-id × responder-eph),
-    //                       (DH involving responder-id × initiator-eph),
-    //                       (eph × eph), (id × id).
-    // Alice is the initiator here, so on Bob's side: peer is initiator.
-    const SK = await deriveHandshakeSecret(dh2, dh1, dh3, dh4);
+    // Match each of our outputs with the DH Alice computes over the same key
+    // pair (DH is symmetric, so same pair == same output):
+    //   our dh1 = DH(myEph, peerId)  — pair {IdA, EphB} — == Alice's dh1 = DH(myId,  peerEph)
+    //   our dh2 = DH(myId,  peerEph) — pair {IdB, EphA} — == Alice's dh2 = DH(myEph, peerId)
+    //   our dh3 = DH(myEph, peerEph) — pair {EphA, EphB} — == Alice's dh3
+    //   our dh4 = DH(myId,  peerId)  — pair {IdA, IdB}  — == Alice's dh4
+    // So both sides pass (dh1, dh2, dh3, dh4) as numbered on their own side.
+    const SK = await deriveHandshakeSecret(dh1, dh2, dh3, dh4);
 
     const ratchet = ratchetInitBob(SK, myEph);
     const session: Session = {
