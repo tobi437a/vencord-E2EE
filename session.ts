@@ -5,7 +5,8 @@
  *
  *   🔐⟨E2EE-INIT v1⟩b64(idPub‖ephPub)
  *       Sent by initiator. Contains 32-byte identity pubkey + 32-byte ephemeral
- *       pubkey. Recipient's plugin auto-replies if E2EE is enabled.
+ *       pubkey. The recipient's plugin stashes it as a pending invitation; the
+ *       ACK is only sent after an explicit user accept (lock click).
  *
  *   🔐⟨E2EE-ACK v1⟩b64(idPub‖ephPub)
  *       Responder's reply. Same shape. After both sides see this exchange they
