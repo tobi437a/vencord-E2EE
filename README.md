@@ -48,12 +48,16 @@ Either side:   🔐⟨E2EE-RESET v1⟩
 
 **Safety numbers.** The first handshake is trust-on-first-use (TOFU). To defend against a hypothetical MITM (e.g. a malicious Discord), both users should compare their **safety number** out of band (voice call, another channel, in person). It is displayed in a toast when the session becomes ready and in the lock button's tooltip. If your numbers match, your identity keys agree and no MITM is present.
 
+**Key change detection.** Each peer's identity pubkey is pinned (per user ID) the first time a handshake completes, and survives session resets. If a later handshake carries a *different* identity key — which is what a MITM forcing a re-handshake looks like, but also what a peer reinstalling the plugin looks like — a loud ⚠️ warning is shown. Verify the safety number out of band before trusting the new session.
+
+**Edit blocking.** Discord edits bypass the encryption hook, so editing an encrypted message would send the new text in plaintext. The plugin blocks edits in E2EE channels; send a new message instead.
+
 ## Limitations
 
 - **Metadata is not protected.** Discord still sees who talks to whom, when, message sizes, channel IDs, and the fact that you are using E2EE (the marker is plaintext).
 - **Local plaintext cache.** Decrypted messages are stored in IndexedDB. If you want true forward secrecy, clear the plugin's data periodically; you will lose the ability to view old messages, but the ciphertexts in Discord remain unreadable.
 - **Both users need this plugin.** There is no plaintext fallback. A peer without the plugin will see only opaque base64.
-- **Attachments, embeds, replies, reactions, and edits are not encrypted.** Only message text.
+- **Attachments, embeds, replies, and reactions are not encrypted.** Only message text. Edits are blocked in E2EE channels (they would leak plaintext).
 - **~1300 character limit.** Encrypted messages are roughly 40% larger after base64. Discord's 2000-character cap leaves room for approximately 1300 characters of plaintext. Chunking is not implemented.
 - **Discord's ToS.** Client mods are technically against Discord's terms of service. Account bans for using Vencord are rare in practice but possible.
 
@@ -80,9 +84,9 @@ The crypto layer (`crypto.ts` + `session.ts`) has no Vencord or Discord dependen
 ## Usage
 
 1. Open a DM with a peer who also has the plugin installed.
-2. Click the 🔓 button in the chat bar. It turns yellow.
-3. Type a message and send. Your message will not be delivered — the plugin sends a handshake INIT instead and notifies you. Retype your message after the lock turns green (🔒).
-4. The peer's plugin prompts them to accept. Once they enable E2EE and send a message, both clients show 🔒 and display a **safety number**.
+2. Click the 🔓 button in the chat bar. The handshake invitation is sent immediately and the lock turns yellow (🟡).
+3. The peer's plugin shows 📩 and prompts them to accept. They click the lock to accept.
+4. Both clients show 🔒 and display a **safety number**.
 5. **Compare safety numbers out of band before sending anything sensitive.**
 6. Every subsequent message is encrypted end-to-end.
 
@@ -93,11 +97,6 @@ To disable E2EE for a DM, click 🔒. The session is destroyed and a reset marke
 | Icon | Meaning |
 |---|---|
 | 🔓 | E2EE off |
-| 🟡 | Handshake in progress or E2EE enabled, awaiting first send |
-| 📩 | Peer has sent a handshake invitation |
+| 🟡 | Handshake in progress, awaiting the peer's accept |
+| 📩 | Peer has sent a handshake invitation — click to accept |
 | 🔒 | Secure channel active — hover for safety number |
-
-## Possible improvements
-
-- **QR code for safety numbers** — render as a scannable QR code (like Signal) for easier out-of-band verification.
-- **Session export / device transfer** — currently there is no way to move a session to a different machine; a fresh handshake is required.
