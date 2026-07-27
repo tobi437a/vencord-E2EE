@@ -86,13 +86,52 @@ const processedHandshakeMsgs = new Set<string>();
  * Plaintext of our own outgoing encrypted messages, keyed by the exact wire
  * string we sent. We can't decrypt our own ciphertext (the ratchet only moves
  * forward), and at pre-send time the message has no ID yet — so we stash the
- * plaintext here and move it into `decryptedCache` (keyed by the real message
+ * plaintext here and copy it into `decryptedCache` (keyed by the real message
  * ID) when the server echoes our message back via MESSAGE_CREATE. Without
  * this, your own messages would render as an "[encrypted]" placeholder
  * forever. Not persisted: it only needs to survive the send → echo window.
+ *
+ * Entries are NOT removed on first use. Discord announces one send several
+ * times — the optimistic local echo, the gateway MESSAGE_CREATE, MESSAGE_SUCCESS,
+ * and any later MESSAGE_UPDATE — and each pass has to resolve to the same
+ * plaintext. Consuming the entry on the first pass made every later pass fall
+ * through to the "[encrypted — sent]" placeholder, which is what the user
+ * actually ends up looking at. The MAX_PENDING_OWN cap is what frees entries.
  */
 const pendingOwnPlaintext = new Map<string, string>();
 const MAX_PENDING_OWN = 200;
+
+/** Stash our own plaintext, evicting the oldest entries past the cap. */
+function rememberOwnPlaintext(wire: string, plaintext: string) {
+    pendingOwnPlaintext.delete(wire);      // re-insert so it counts as newest
+    pendingOwnPlaintext.set(wire, plaintext);
+    while (pendingOwnPlaintext.size > MAX_PENDING_OWN) {
+        const oldest = pendingOwnPlaintext.keys().next().value;
+        if (oldest === undefined) break;
+        pendingOwnPlaintext.delete(oldest);
+    }
+}
+
+/** Look up our own plaintext for a wire string, refreshing its position so a
+ *  message that is still being re-dispatched can't be evicted underneath us. */
+function recallOwnPlaintext(wire: string): string | undefined {
+    const pt = pendingOwnPlaintext.get(wire);
+    if (pt === undefined) return undefined;
+    pendingOwnPlaintext.delete(wire);
+    pendingOwnPlaintext.set(wire, pt);
+    return pt;
+}
+
+/**
+ * Ciphertext of our own in-flight messages, keyed by the optimistic (local)
+ * message ID Discord assigns to the echo it renders before the server replies.
+ * We rewrite that echo to plaintext so you see what you typed — but if the
+ * send then fails, the failed message stays in the store and Discord's retry
+ * re-sends its content. Putting the ciphertext back on MESSAGE_SEND_FAILED
+ * keeps a retry from shipping that plaintext in the clear.
+ */
+const inFlightWire = new Map<string, string>();
+const MAX_IN_FLIGHT = 50;
 
 /** Cap so the persisted plaintext cache can't grow without bound.
  *  Maps iterate in insertion order, so this evicts the oldest entries. */
@@ -309,12 +348,7 @@ const onSend: MessageSendListener = async (channelId, msg) => {
         const wire = await encryptForSession(s, plaintext);
         msg.content = wire;
         // Remember our own plaintext so the echoed message renders readably.
-        pendingOwnPlaintext.set(wire, plaintext);
-        while (pendingOwnPlaintext.size > MAX_PENDING_OWN) {
-            const oldest = pendingOwnPlaintext.keys().next().value;
-            if (oldest === undefined) break;
-            pendingOwnPlaintext.delete(oldest);
-        }
+        rememberOwnPlaintext(wire, plaintext);
         await persistSessions();    // ratchet state advances on every send
     } catch (e) {
         log.error("Encrypt failed", e);
@@ -364,7 +398,14 @@ const onEdit: MessageEditListener = (channelId, messageId) => {
 
 // ------------------------------ Incoming message hook ------------------------------
 
-async function handleIncoming(channelId: string, message: any): Promise<void> {
+/**
+ * @param optimistic True for the local echo Discord renders immediately after
+ *   you hit enter, before the server has confirmed anything. Its message ID is
+ *   client-side and gets thrown away once the gateway echo arrives, so such a
+ *   message may be rendered but must never have anything persisted under its
+ *   ID (neither decrypted plaintext nor the processed-handshake set).
+ */
+async function handleIncoming(channelId: string, message: any, optimistic = false): Promise<void> {
     if (!identity || !message?.content) return;
     const content: string = message.content;
     if (!isE2EEMessage(content)) return;
@@ -382,6 +423,24 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
     if (!me?.id || !message.author?.id) return;
     const fromSelf = message.author.id === me.id;
 
+    // Remember what we're about to render over, so a failed send can be put
+    // back on the wire (see inFlightWire).
+    if (optimistic && fromSelf && message.id) {
+        inFlightWire.delete(message.id);
+        inFlightWire.set(message.id, content);
+        while (inFlightWire.size > MAX_IN_FLIGHT) {
+            const oldest = inFlightWire.keys().next().value;
+            if (oldest === undefined) break;
+            inFlightWire.delete(oldest);
+        }
+    }
+
+    /** markProcessed, but a no-op for optimistic echoes: their IDs are
+     *  throwaway, and persisting them would grow the set forever without ever
+     *  matching a real message. The gateway copy marks the real ID. */
+    const markProcessedIfReal = (id: string) =>
+        optimistic ? Promise.resolve() : markProcessed(id);
+
     // For handshake messages (INIT / ACK / RESET) we de-dupe by message ID:
     // any given handshake message must take its state-mutating effect at most
     // once, ever. This is what protects us from LOAD_MESSAGES_SUCCESS feeding
@@ -398,7 +457,7 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
             if (fromSelf) {
                 // Our own outgoing INIT — purely cosmetic on render.
                 replaceContent(channelId, message, "🔐 [E2EE handshake invitation sent]");
-                await markProcessed(message.id);
+                await markProcessedIfReal(message.id);
                 return;
             }
             if (alreadyProcessed) {
@@ -429,7 +488,7 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
                     `🔐 Peer sent a handshake invitation, but ${reason}. ` +
                     "Toggle the lock off and on to reset if you want to accept it."
                 );
-                await markProcessed(message.id);
+                await markProcessedIfReal(message.id);
                 return;
             }
 
@@ -473,14 +532,14 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
                     "to accept (or ignore to decline)."
                 );
             }
-            await markProcessed(message.id);
+            await markProcessedIfReal(message.id);
             return;
         }
 
         if (content.startsWith(PREFIX_ACK)) {
             if (fromSelf) {
                 replaceContent(channelId, message, "🔐 [E2EE handshake response sent]");
-                await markProcessed(message.id);
+                await markProcessedIfReal(message.id);
                 return;
             }
             if (alreadyProcessed) {
@@ -491,7 +550,7 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
             if (!s || s.phase !== "init-sent" || !s.pendingEph) {
                 log.warn("Got ACK with no pending init for channel", channelId);
                 replaceContent(channelId, message, "🔐 [unexpected E2EE ACK]");
-                await markProcessed(message.id);
+                await markProcessedIfReal(message.id);
                 return;
             }
             const newSession = await handleAck(identity, s.pendingEph, content);
@@ -516,7 +575,7 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
             try {
                 const primeText = "🔐 Secure channel established.";
                 const primeWire = await encryptForSession(newSession, primeText);
-                pendingOwnPlaintext.set(primeWire, primeText);
+                rememberOwnPlaintext(primeWire, primeText);
                 sendRaw(channelId, primeWire);
             } catch (e) {
                 log.error("Failed to send priming message", e);
@@ -538,7 +597,7 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
                     Toasts.Type.SUCCESS
                 );
             }
-            await markProcessed(message.id);
+            await markProcessedIfReal(message.id);
             return;
         }
 
@@ -548,7 +607,7 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
             // RESET during a history load.
             if (fromSelf) {
                 replaceContent(channelId, message, "🔐 [E2EE reset sent]");
-                await markProcessed(message.id);
+                await markProcessedIfReal(message.id);
                 return;
             }
             if (alreadyProcessed) {
@@ -559,7 +618,7 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
             await persistSessions();
             notifyStateChange();
             replaceContent(channelId, message, "🔐 Peer reset the secure channel.");
-            await markProcessed(message.id);
+            await markProcessedIfReal(message.id);
             return;
         }
 
@@ -572,15 +631,22 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
 
             // Our own outgoing ciphertext: we can't decrypt it (forward secrecy
             // moves the ratchet forward), but we don't need to — we stashed the
-            // plaintext at send time. Promote it into the persistent cache now
+            // plaintext at send time. Copy it into the persistent cache now
             // that we know the message ID. Falls back to a placeholder for
             // messages sent before this client session (or from another device).
+            //
+            // The stash entry stays put: Discord re-announces the same send
+            // (optimistic echo → gateway echo → MESSAGE_SUCCESS), and every one
+            // of those has to resolve here. Only the real echo may write the
+            // cache — an optimistic ID is client-side and would just be dead
+            // weight in persisted storage.
             if (fromSelf) {
-                const pt = pendingOwnPlaintext.get(content);
+                const pt = recallOwnPlaintext(content);
                 if (pt !== undefined) {
-                    pendingOwnPlaintext.delete(content);
-                    cacheDecrypted(message.id, pt);
-                    await persistDecrypted();
+                    if (!optimistic) {
+                        cacheDecrypted(message.id, pt);
+                        await persistDecrypted();
+                    }
                     replaceContent(channelId, message, pt);
                 } else {
                     replaceContent(channelId, message, "🔐 [encrypted — sent]");
@@ -603,7 +669,7 @@ async function handleIncoming(channelId: string, message: any): Promise<void> {
         log.error("Failed to handle incoming E2EE message", e);
         // Mark broken handshake messages processed so history loads don't
         // retry (and re-fail) them forever.
-        if (isHandshake) await markProcessed(message.id).catch(() => { });
+        if (isHandshake) await markProcessedIfReal(message.id).catch(() => { });
         replaceContent(
             channelId, message,
             isHandshake ? "🔐 [invalid E2EE handshake message]" : "🔐 [decryption failed]"
@@ -660,10 +726,10 @@ function isDM(ch: any): boolean {
  * the same chain key and derive wrong message keys or clobber counters.
  */
 const channelQueues = new Map<string, Promise<void>>();
-function enqueueIncoming(channelId: string, message: any) {
+function enqueueIncoming(channelId: string, message: any, optimistic = false) {
     const prev = channelQueues.get(channelId) ?? Promise.resolve();
     const next = prev
-        .then(() => handleIncoming(channelId, message))
+        .then(() => handleIncoming(channelId, message, optimistic))
         .catch(err => log.error("Failed to handle incoming message", err));
     channelQueues.set(channelId, next);
 }
@@ -813,10 +879,34 @@ export default definePlugin({
 
         // Incoming via Flux. All paths go through the per-channel queue so
         // ratchet operations on one session never interleave.
-        const onCreate = (e: { channelId: string; message: any }) => {
-            enqueueIncoming(e.channelId, e.message);
+        //
+        // MESSAGE_CREATE fires twice for our own sends: once with optimistic=true for the
+        // local echo Discord paints immediately, then again when the gateway
+        // sends the real message back. Both have to render as plaintext; only
+        // the second one carries an ID worth remembering.
+        const onCreate = (e: { channelId: string; message: any; optimistic?: boolean }) => {
+            enqueueIncoming(e.channelId, e.message, e.optimistic === true);
         };
         subscribe("MESSAGE_CREATE", onCreate);
+
+        // The HTTP send resolved: the optimistic record is swapped for the
+        // server's copy, which puts raw ciphertext back into the store if this
+        // lands after the gateway MESSAGE_CREATE. Re-render from the stash.
+        subscribe("MESSAGE_SUCCESS", (e: { channelId: string; messageId?: string; message?: any }) => {
+            if (e.messageId) inFlightWire.delete(e.messageId);
+            if (e.message?.id) inFlightWire.delete(e.message.id);
+            if (e.message) enqueueIncoming(e.channelId ?? e.message.channel_id, e.message);
+        });
+
+        // The send failed. Discord keeps the message around with a retry
+        // affordance that re-sends whatever content the record holds, so undo
+        // our plaintext rewrite before the user can click it.
+        subscribe("MESSAGE_SEND_FAILED", (e: { channelId: string; messageId: string }) => {
+            const wire = inFlightWire.get(e.messageId);
+            if (!wire) return;
+            inFlightWire.delete(e.messageId);
+            updateMessage(e.channelId, e.messageId, { content: wire });
+        });
 
         // Bulk loads (history scrollback / channel switch). Discord delivers
         // these newest-first; process oldest-first so the ratchet mostly
