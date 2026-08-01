@@ -1,48 +1,239 @@
 /*
  * Per-channel session lifecycle, handshake protocol, persistence.
  *
+ * ============================ PROTOCOL v2 ============================
+ *
  * Wire format (all messages prefixed with 🔐 so they're visually distinct):
  *
- *   🔐⟨E2EE-INIT v1⟩b64(idPub‖ephPub)
+ *   🔐⟨E2EE-INIT v2⟩b64(idPub‖ephPub)
  *       Sent by initiator. Contains 32-byte identity pubkey + 32-byte ephemeral
  *       pubkey. The recipient's plugin stashes it as a pending invitation; the
  *       ACK is only sent after an explicit user accept (lock click).
  *
- *   🔐⟨E2EE-ACK v1⟩b64(idPub‖ephPub)
+ *   🔐⟨E2EE-ACK v2⟩b64(idPub‖ephPub)
  *       Responder's reply. Same shape. After both sides see this exchange they
  *       can derive the same 32-byte SK and bootstrap a Double Ratchet session.
  *
- *   🔐⟨E2EE v1⟩b64(header‖ciphertext)
- *       Normal encrypted message.
+ *   🔐⟨E2EE v2⟩b64(header‖ciphertext)
+ *       Normal encrypted message. The AEAD plaintext is a *frame*, not bare
+ *       UTF-8 — see "Message frames" below.
  *
- *   🔐⟨E2EE-RESET v1⟩
+ *   🔐⟨E2EE-RESET v2⟩
  *       Either side can send this to tear down the session (e.g. if decryption
  *       starts failing because state got out of sync). The other side will
  *       discard its session and the next encrypted send will trigger a new
  *       handshake.
+ *
+ * Changes from v1:
+ *   - Message bodies are framed with a 1-byte codec flag and may be DEFLATE
+ *     compressed (see `packFrame`).
+ *   - The AEAD additional-data string and the handshake HKDF info string are
+ *     version-scoped, so a v1 and a v2 client can never derive matching keys.
+ *     Combined with the changed prefixes this makes the versions cleanly
+ *     non-interoperable rather than subtly broken: a v1 peer's messages are
+ *     recognised (`isLegacyE2EEMessage`) and reported, not mis-decrypted.
+ *
+ * Message frames
+ * --------------
+ * The bytes handed to the ratchet are:
+ *
+ *     [1 byte codec flag][payload]
+ *
+ *     0x00 FRAME_RAW      payload is UTF-8 plaintext
+ *     0x01 FRAME_DEFLATE  payload is raw-DEFLATE of UTF-8 plaintext
+ *
+ * The flag lives inside the AEAD, so it is authenticated and a tampering
+ * Discord cannot flip a message between codecs.
+ *
+ * Compression is opportunistic: we only emit FRAME_DEFLATE when the compressed
+ * payload is genuinely smaller AND decompresses back to the exact input bytes.
+ * Most Discord messages are short enough that DEFLATE expands them, so in
+ * practice the common case stays FRAME_RAW at a cost of one byte.
  */
 
+import { compressionAvailable, deflateRaw, inflateRaw } from "./compress";
 import {
     KeyPair, RatchetState, SerializedState,
     generateDH, dh, deriveHandshakeSecret,
     ratchetInitAlice, ratchetInitBob, ratchetEncrypt, ratchetDecrypt,
     serializeState, deserializeState,
     exportPrivateJwk, importPrivateJwk,
-    b64encode, b64decode, utf8, utf8d, concat, safetyNumber,
+    b64encode, b64decode, bytesEqual, utf8, utf8dStrict, concat, safetyNumber,
 } from "./crypto";
 
 // ------------------------------ Wire markers ------------------------------
 
-export const PREFIX_INIT  = "🔐⟨E2EE-INIT v1⟩";
-export const PREFIX_ACK   = "🔐⟨E2EE-ACK v1⟩";
-export const PREFIX_MSG   = "🔐⟨E2EE v1⟩";
-export const PREFIX_RESET = "🔐⟨E2EE-RESET v1⟩";
+export const PROTOCOL_VERSION = "v2";
 
-export function isE2EEMessage(content: string): boolean {
+export const PREFIX_INIT  = "🔐⟨E2EE-INIT v2⟩";
+export const PREFIX_ACK   = "🔐⟨E2EE-ACK v2⟩";
+export const PREFIX_MSG   = "🔐⟨E2EE v2⟩";
+export const PREFIX_RESET = "🔐⟨E2EE-RESET v2⟩";
+
+/** v1 markers. We never emit these; they exist so that a peer who hasn't
+ *  upgraded — or our own pre-upgrade history — is recognised and labelled
+ *  rather than rendered as a wall of base64. */
+export const LEGACY_PREFIXES = [
+    "🔐⟨E2EE-INIT v1⟩",
+    "🔐⟨E2EE-ACK v1⟩",
+    "🔐⟨E2EE v1⟩",
+    "🔐⟨E2EE-RESET v1⟩",
+] as const;
+
+/** True for markers this build produces. */
+export function isCurrentE2EEMessage(content: string): boolean {
     return content.startsWith(PREFIX_INIT)
         || content.startsWith(PREFIX_ACK)
         || content.startsWith(PREFIX_MSG)
         || content.startsWith(PREFIX_RESET);
+}
+
+/** True for v1 markers only. */
+export function isLegacyE2EEMessage(content: string): boolean {
+    return LEGACY_PREFIXES.some(p => content.startsWith(p));
+}
+
+/** True for any protocol version. Callers that need to answer "is this one of
+ *  ours, hands off" (the pre-send and pre-edit hooks) must use this, so a v1
+ *  message left in history is never treated as user text. */
+export function isE2EEMessage(content: string): boolean {
+    return isCurrentE2EEMessage(content) || isLegacyE2EEMessage(content);
+}
+
+// ------------------------------ Message framing ------------------------------
+
+export const FRAME_RAW = 0x00;
+export const FRAME_DEFLATE = 0x01;
+
+/**
+ * Don't even attempt DEFLATE below this many bytes. Raw DEFLATE needs a few
+ * bytes of block overhead plus enough repetition to build a useful Huffman
+ * table, so short messages — the overwhelming majority of Discord traffic —
+ * always come out larger. Skipping them avoids pointless CPU on the hot path;
+ * the size comparison in `packFrame` is what actually enforces correctness.
+ */
+export const COMPRESS_MIN_BYTES = 64;
+
+/**
+ * Build the AEAD plaintext for `text`.
+ *
+ * Compression is attempted only when it can plausibly pay off, and is accepted
+ * only when it (a) produces fewer bytes and (b) round-trips back to the exact
+ * input. The round-trip check costs one inflate on an already-small buffer and
+ * buys a hard guarantee: a compression-layer bug can never silently ship a
+ * message the peer will decode into different text. It degrades to FRAME_RAW,
+ * which always works.
+ *
+ * Any failure in the compression path — unsupported format, a throwing stream,
+ * a mismatched round-trip — falls through to FRAME_RAW rather than propagating,
+ * because an uncompressed message is always a valid message.
+ */
+export async function packFrame(text: string): Promise<Uint8Array> {
+    const raw = utf8(text);
+
+    if (raw.length >= COMPRESS_MIN_BYTES && compressionAvailable()) {
+        try {
+            const deflated = await deflateRaw(raw);
+            // Both framings carry the same 1-byte flag, so comparing payload
+            // lengths directly is the right test for "did this actually help".
+            if (deflated.length < raw.length && bytesEqual(await inflateRaw(deflated), raw)) {
+                return concat(Uint8Array.of(FRAME_DEFLATE), deflated);
+            }
+        } catch {
+            // Fall through to FRAME_RAW.
+        }
+    }
+
+    return concat(Uint8Array.of(FRAME_RAW), raw);
+}
+
+/** Inverse of `packFrame`. Throws on an unknown flag, corrupt DEFLATE data or
+ *  invalid UTF-8 — all of which mean the message is genuinely undecodable. */
+export async function unpackFrame(frame: Uint8Array): Promise<string> {
+    if (frame.length < 1) throw new Error("empty message frame");
+
+    const flag = frame[0];
+    const payload = frame.subarray(1);
+
+    switch (flag) {
+        case FRAME_RAW:
+            return utf8dStrict(payload);
+        case FRAME_DEFLATE:
+            if (!compressionAvailable()) {
+                throw new Error("peer sent a compressed message but DecompressionStream is unavailable here");
+            }
+            return utf8dStrict(await inflateRaw(payload));
+        default:
+            throw new Error(`unknown message codec flag 0x${flag.toString(16).padStart(2, "0")}`);
+    }
+}
+
+// ------------------------------ Size accounting ------------------------------
+
+/** Discord's hard cap for a single message. Nitro raises this to 4000, but we
+ *  budget for the floor: a message that overflows is rejected at send time, and
+ *  guessing high would turn that into a failed send instead. */
+export const DISCORD_MAX_MESSAGE_LENGTH = 2000;
+
+const HEADER_BYTES = 40;      // 32B ratchet pubkey + 4B pn + 4B n
+const AEAD_TAG_BYTES = 16;    // AES-GCM tag
+
+/** Length of `btoa` output for `n` input bytes, padding included. */
+export function base64Length(n: number): number {
+    return Math.ceil(n / 3) * 4;
+}
+
+/**
+ * Exact length of the wire string a frame of `frameBytes` will produce.
+ *
+ * Every term is deterministic — AES-GCM ciphertext is exactly plaintext + tag,
+ * and base64 expansion is a pure function of length — so this is an equality,
+ * not an estimate. tests/session.test.ts asserts it against real encryptions.
+ *
+ * Measured in UTF-16 code units (`String.length`) because that is both what
+ * `String.length` reports and the more conservative of the two plausible
+ * countings: the 🔐 in the prefix is a surrogate pair, so this over-counts the
+ * prefix by one versus code points. Erring high is the safe direction.
+ */
+export function projectedWireLength(frameBytes: number): number {
+    return PREFIX_MSG.length + base64Length(HEADER_BYTES + frameBytes + AEAD_TAG_BYTES);
+}
+
+/** Largest frame that still fits `limit`. Inverse of `projectedWireLength`. */
+export function maxFrameBytes(limit: number = DISCORD_MAX_MESSAGE_LENGTH): number {
+    const base64Budget = limit - PREFIX_MSG.length;
+    const byteBudget = Math.floor(base64Budget / 4) * 3;
+    return byteBudget - HEADER_BYTES - AEAD_TAG_BYTES;
+}
+
+/** Thrown by `encryptForSession` when the finished message wouldn't fit.
+ *  Raised *before* the ratchet advances — see `encryptForSession`. */
+export class MessageTooLongError extends Error {
+    readonly wireLength: number;
+    readonly maxLength: number;
+
+    constructor(wireLength: number, maxLength: number) {
+        super(`encrypted message is ${wireLength} characters, over Discord's ${maxLength} limit`);
+        this.name = "MessageTooLongError";
+        this.wireLength = wireLength;
+        this.maxLength = maxLength;
+    }
+
+    /** How many wire characters must go. */
+    get overBy(): number {
+        return this.wireLength - this.maxLength;
+    }
+
+    /** Roughly how many plaintext characters the user needs to cut.
+     *
+     *  Base64 turns 3 bytes into 4 characters, so shedding `overBy` wire
+     *  characters needs about 3/4 as many bytes. This is a lower bound for
+     *  compressed frames (where a byte of plaintext is worth less than a byte
+     *  of frame) and exact for ASCII in a raw frame, so it is advisory only —
+     *  the authoritative check is re-running the send. */
+    get approxCharsToRemove(): number {
+        return Math.ceil(this.overBy * 3 / 4);
+    }
 }
 
 // ------------------------------ Identity ------------------------------
@@ -249,17 +440,47 @@ export async function handleAck(
 
 // ------------------------------ Encrypt / decrypt wrappers ------------------------------
 
+/** Additional authenticated data bound into every message's AEAD. */
+const AD = utf8("vencord-e2ee/v2");
+
+/**
+ * Encrypt one message.
+ *
+ * Ordering matters: the frame is built and size-checked BEFORE `ratchetEncrypt`
+ * runs. `ratchetEncrypt` mutates the sending chain on every call, so a message
+ * we end up refusing to send would otherwise burn a message key — leaving a
+ * permanent gap that the peer can only paper over with skipped-key handling,
+ * and that counts against MAX_SKIP. Rejecting first keeps a refused send
+ * completely free of side effects on the session.
+ *
+ * @throws {MessageTooLongError} if the finished wire string exceeds Discord's cap.
+ */
 export async function encryptForSession(s: Session, plaintext: string): Promise<string> {
     if (s.phase !== "ready" || !s.ratchet) throw new Error("session not ready");
-    const ad = utf8("vencord-e2ee/v1");
-    const ct = await ratchetEncrypt(s.ratchet, utf8(plaintext), ad);
+
+    const frame = await packFrame(plaintext);
+
+    const projected = projectedWireLength(frame.length);
+    if (projected > DISCORD_MAX_MESSAGE_LENGTH) {
+        throw new MessageTooLongError(projected, DISCORD_MAX_MESSAGE_LENGTH);
+    }
+
+    const ct = await ratchetEncrypt(s.ratchet, frame, AD);
     return PREFIX_MSG + b64encode(ct);
 }
 
+/**
+ * Decrypt one message.
+ *
+ * Note the asymmetry with `encryptForSession`: `ratchetDecrypt` commits the
+ * ratchet as soon as the AEAD authenticates, so a frame that decrypts but fails
+ * to *unpack* (unknown codec flag, corrupt DEFLATE, invalid UTF-8) still
+ * consumes its message key. That is deliberate — the key genuinely was used,
+ * and re-deriving it later would be worse than losing one undecodable message.
+ */
 export async function decryptForSession(s: Session, wire: string): Promise<string> {
     if (s.phase !== "ready" || !s.ratchet) throw new Error("session not ready");
     if (!wire.startsWith(PREFIX_MSG)) throw new Error("not an E2EE message");
-    const ad = utf8("vencord-e2ee/v1");
-    const pt = await ratchetDecrypt(s.ratchet, b64decode(wire.slice(PREFIX_MSG.length)), ad);
-    return utf8d(pt);
+    const frame = await ratchetDecrypt(s.ratchet, b64decode(wire.slice(PREFIX_MSG.length)), AD);
+    return unpackFrame(frame);
 }

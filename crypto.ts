@@ -19,9 +19,15 @@
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
+const decStrict = new TextDecoder("utf-8", { fatal: true });
 
 export function utf8(s: string): Uint8Array { return enc.encode(s); }
 export function utf8d(b: Uint8Array): string { return dec.decode(b); }
+
+/** Lenient decoding turns malformed bytes into U+FFFD, which would let a
+ *  corrupted message render as plausible-looking mojibake. Message bodies go
+ *  through this instead so corruption is a hard error we can report. */
+export function utf8dStrict(b: Uint8Array): string { return decStrict.decode(b); }
 
 export function b64encode(bytes: Uint8Array): string {
     let s = "";
@@ -369,7 +375,10 @@ export async function deriveHandshakeSecret(
 ): Promise<Uint8Array> {
     const ikm = concat(dh1, dh2, dh3, dh4);
     // Use a 32-byte zero salt; HKDF spec-compliant, gives full 256 bits of output.
-    return hkdf(ikm, new Uint8Array(32), utf8("vencord-e2ee/handshake-v1"), 32);
+    // The info string is version-scoped: bumping the protocol version changes
+    // every derived key, so a v1 and a v2 client cannot accidentally agree on a
+    // session even if their handshake bytes happen to line up.
+    return hkdf(ikm, new Uint8Array(32), utf8("vencord-e2ee/handshake-v2"), 32);
 }
 
 /** Safety number: 6 groups of 5 digits derived from both identity pubkeys.

@@ -24,6 +24,7 @@ import {
     removeMessagePreSendListener,
 } from "@api/MessageEvents";
 import { ChatBarButton, ChatBarButtonFactory } from "@api/ChatButtons";
+import { FormSwitch } from "@components/FormSwitch";
 import { updateMessage } from "@api/MessageUpdater";
 import {
     showToast, Toasts,
@@ -33,15 +34,21 @@ import { sendMessage } from "@utils/discord";
 import { Logger } from "@utils/Logger";
 
 import { b64encode } from "./crypto";
+import { askPassphrase } from "./PassphraseModal";
 import {
     Identity, Session, SerializedIdentity, SerializedSession,
     emptySession, newIdentity,
     serializeIdentity, deserializeIdentity,
     serializeSession, deserializeSession,
-    isE2EEMessage, encryptForSession, decryptForSession,
+    isE2EEMessage, isLegacyE2EEMessage, encryptForSession, decryptForSession,
     buildInit, parseInit, buildAck, handleAck,
+    MessageTooLongError,
     PREFIX_INIT, PREFIX_ACK, PREFIX_MSG, PREFIX_RESET,
 } from "./session";
+import {
+    VaultMeta, WrongPassphraseError,
+    isVaultBlob, isVaultMeta, makeVaultMeta, unlockVault, vaultDecrypt, vaultEncrypt,
+} from "./vault";
 
 // ------------------------------ Logger ------------------------------
 
@@ -49,12 +56,36 @@ const log = new Logger("E2EE");
 
 // ------------------------------ Persistent storage ------------------------------
 
-const STORE_IDENTITY = "E2EE_identity_v1";
-const STORE_SESSIONS = "E2EE_sessions_v1";       // Record<channelId, SerializedSession>
-const STORE_DECRYPTED = "E2EE_decrypted_v1";     // Record<messageId, string>
-const STORE_ENABLED  = "E2EE_enabled_v1";        // Record<channelId, boolean>
-const STORE_PROCESSED = "E2EE_processed_v1";     // string[] of handshake message IDs
-const STORE_KNOWN_KEYS = "E2EE_knownKeys_v1";    // Record<userId, b64 identity pubkey>
+/*
+ * Stores split into two classes.
+ *
+ * SECRET stores are wrapped by the vault when at-rest encryption is on:
+ *   identity   — the long-term X25519 private key
+ *   sessions   — root keys, chain keys, skipped message keys
+ *   decrypted  — the plaintext of every message you've read
+ *
+ * PUBLIC stores are never wrapped. That is a deliberate choice, not an
+ * oversight: their contents (channel IDs, message IDs, peer *public* keys) tell
+ * an attacker nothing the Discord account itself doesn't already reveal, and
+ * `enabled` in particular has to remain readable while the vault is locked.
+ * It is the only record of "this DM is supposed to be encrypted" — without it,
+ * a locked plugin couldn't tell an E2EE channel from a normal one and would
+ * happily let a message meant for an encrypted DM go out in the clear.
+ */
+const STORE_IDENTITY = "E2EE_identity_v2";       // SECRET
+const STORE_SESSIONS = "E2EE_sessions_v2";       // SECRET Record<channelId, SerializedSession>
+const STORE_DECRYPTED = "E2EE_decrypted_v2";     // SECRET Record<messageId, string>
+const STORE_ENABLED  = "E2EE_enabled_v2";        // public  Record<channelId, boolean>
+const STORE_PROCESSED = "E2EE_processed_v2";     // public  string[] of handshake message IDs
+const STORE_KNOWN_KEYS = "E2EE_knownKeys_v2";    // public  Record<userId, b64 identity pubkey>
+const STORE_VAULT = "E2EE_vault_v2";             // public  VaultMeta
+
+const LEGACY_STORE_IDENTITY = "E2EE_identity_v1";
+const LEGACY_STORE_SESSIONS = "E2EE_sessions_v1";
+const LEGACY_STORE_DECRYPTED = "E2EE_decrypted_v1";
+const LEGACY_STORE_ENABLED = "E2EE_enabled_v1";
+const LEGACY_STORE_PROCESSED = "E2EE_processed_v1";
+const LEGACY_STORE_KNOWN_KEYS = "E2EE_knownKeys_v1";
 
 let identity: Identity | null = null;
 const sessions = new Map<string, Session>();
@@ -158,51 +189,207 @@ function notifyStateChange() {
     }
 }
 
+// ------------------------------ Vault (encryption at rest) ------------------------------
+
+/** Derived from the user's passphrase; null when at-rest encryption is off. */
+let vaultKey: CryptoKey | null = null;
+/** True when stored data IS encrypted but we couldn't decrypt it (the user
+ *  dismissed the unlock prompt). The plugin then runs in a degraded read-only
+ *  mode: no identity, no sessions, and — critically — no plaintext sends. */
+let vaultLocked = false;
+/**
+ * Whether stored data is actually encrypted, i.e. whether vault metadata
+ * exists. This — not a saved boolean — is what the settings toggle displays;
+ * see `EncryptAtRestSetting` for why that distinction matters.
+ */
+let vaultActive = false;
+
+/** Read a SECRET store, transparently unwrapping it if it's vault-encrypted. */
+async function readSecret<T>(key: string): Promise<T | undefined> {
+    const raw = await DataStore.get<unknown>(key);
+    if (raw === undefined) return undefined;
+    if (isVaultBlob(raw)) {
+        if (!vaultKey) throw new Error(`${key} is encrypted but the vault is locked`);
+        return await vaultDecrypt<T>(vaultKey, raw);
+    }
+    // Plaintext record: either at-rest encryption is off, or this store hasn't
+    // been rewritten since it was turned on. Either way it reads fine, and the
+    // next write will encrypt it.
+    return raw as T;
+}
+
+/** Write a SECRET store, wrapping it if the vault is unlocked and in use. */
+async function writeSecret(key: string, value: unknown): Promise<void> {
+    // Refusing to write while locked is what keeps a dismissed unlock prompt
+    // from being destructive. In that state every in-memory map is empty, so an
+    // unguarded write would serialise "no identity, no sessions, no cached
+    // messages" straight over the user's real (encrypted) data.
+    if (vaultLocked) return;
+    await DataStore.set(key, vaultKey ? await vaultEncrypt(vaultKey, value) : value);
+}
+
+/**
+ * Carry v1 data forward.
+ *
+ * The identity keypair and the pinned peer keys are plain X25519 material with
+ * no protocol version baked into them, so they migrate as-is. That matters:
+ * regenerating the identity on upgrade would make every peer's client shout
+ * "identity key CHANGED" — training users to click through the exact warning
+ * that is supposed to mean "possible MITM".
+ *
+ * v1 *sessions* are deliberately dropped. Their ratchet state is only valid
+ * under v1's AEAD additional-data string, and the peer will be upgrading at a
+ * different time anyway, so a clean re-handshake is the only coherent outcome.
+ * `enabled` survives, so those DMs simply re-handshake on the next message.
+ *
+ * The v1 records are deleted afterwards rather than left as a backup: they
+ * include the identity private key in the clear, and leaving a plaintext copy
+ * behind would quietly defeat at-rest encryption for anyone who turns it on.
+ */
+async function migrateLegacyStores() {
+    if (await DataStore.get(STORE_IDENTITY) !== undefined) return;   // already on v2
+
+    const legacyIdentity = await DataStore.get<SerializedIdentity>(LEGACY_STORE_IDENTITY);
+    if (!legacyIdentity) return;                                     // fresh install
+
+    log.info("Migrating v1 data to protocol v2");
+
+    await DataStore.set(STORE_IDENTITY, legacyIdentity);
+
+    const legacyKnown = await DataStore.get<Record<string, string>>(LEGACY_STORE_KNOWN_KEYS);
+    if (legacyKnown) await DataStore.set(STORE_KNOWN_KEYS, legacyKnown);
+
+    const legacyDecrypted = await DataStore.get<Record<string, string>>(LEGACY_STORE_DECRYPTED);
+    if (legacyDecrypted) await DataStore.set(STORE_DECRYPTED, legacyDecrypted);
+
+    const legacyEnabled = await DataStore.get<Record<string, boolean>>(LEGACY_STORE_ENABLED);
+    if (legacyEnabled) await DataStore.set(STORE_ENABLED, legacyEnabled);
+
+    // STORE_PROCESSED is not carried over on purpose: v1 handshake messages no
+    // longer reach any state-mutating branch (they're caught by the legacy
+    // check in handleIncoming), so the de-dupe set has nothing left to protect.
+
+    for (const key of [
+        LEGACY_STORE_IDENTITY, LEGACY_STORE_SESSIONS, LEGACY_STORE_DECRYPTED,
+        LEGACY_STORE_ENABLED, LEGACY_STORE_PROCESSED, LEGACY_STORE_KNOWN_KEYS,
+    ]) {
+        await DataStore.del(key);
+    }
+
+    log.info("Migration complete — existing DMs will re-handshake under v2");
+}
+
+/** Prompt for the passphrase until it verifies or the user gives up. */
+async function promptUnlock(meta: VaultMeta): Promise<CryptoKey | null> {
+    let derived: CryptoKey | null = null;
+    const answered = await askPassphrase("unlock", async passphrase => {
+        try {
+            derived = await unlockVault(passphrase, meta);
+            return null;
+        } catch (e) {
+            derived = null;
+            if (e instanceof WrongPassphraseError) return "That password isn't right. Try again.";
+            log.error("Vault unlock failed", e);
+            return `Could not unlock: ${e}`;
+        }
+    });
+    return answered === null ? null : derived;
+}
+
 async function loadAll() {
-    // Identity
-    const idRaw = await DataStore.get<SerializedIdentity>(STORE_IDENTITY);
+    await migrateLegacyStores();
+
+    // Public stores first and unconditionally — see the STORE_* comments for
+    // why `enabled` must be available even when we can't decrypt anything.
+    const enRaw = await DataStore.get<Record<string, boolean>>(STORE_ENABLED) ?? {};
+    for (const [chId, on] of Object.entries(enRaw)) if (on) enabledChannels.add(chId);
+
+    const procRaw = await DataStore.get<string[]>(STORE_PROCESSED) ?? [];
+    for (const id of procRaw) processedHandshakeMsgs.add(id);
+
+    const keysRaw = await DataStore.get<Record<string, string>>(STORE_KNOWN_KEYS) ?? {};
+    for (const [uId, k] of Object.entries(keysRaw)) knownPeerKeys.set(uId, k);
+
+    // The presence of vault metadata — not the setting — is what decides
+    // whether the data is encrypted. The setting records intent and can drift
+    // from reality if a migration was interrupted; the metadata cannot.
+    const meta = await DataStore.get<unknown>(STORE_VAULT);
+    if (isVaultMeta(meta)) {
+        vaultActive = true;
+
+        // Locked *first*, prompt second. `start()` continues immediately and
+        // installs the message hooks, so the flag has to be set before any send
+        // can reach them — otherwise there would be a window where an E2EE
+        // channel had no session and no lock flag, which is precisely the shape
+        // that leaks plaintext.
+        vaultLocked = true;
+        notifyStateChange();
+
+        // Deliberately not awaited. Blocking plugin start on a modal would
+        // stall Vencord's startup, and the modal needs Discord's UI mounted to
+        // render at all — which it may not be this early. If the prompt never
+        // appears, the 🔑 lock button is the retry path.
+        void unlockAndLoad(meta);
+        return;
+    }
+
+    await loadSecrets();
+}
+
+/** Prompt for the passphrase and, on success, load what the locked start
+ *  skipped. Leaves the plugin locked if the user declines. */
+async function unlockAndLoad(meta: VaultMeta): Promise<boolean> {
+    const key = await promptUnlock(meta);
+    if (!key) {
+        log.warn("E2EE data left locked — no identity or sessions loaded");
+        return false;
+    }
+
+    vaultKey = key;
+    vaultLocked = false;
+    await loadSecrets();
+    notifyStateChange();
+    return true;
+}
+
+/** Load the SECRET stores. Only ever called with the vault unlocked (or absent),
+ *  which is what stops a locked start from generating a fresh identity and
+ *  silently orphaning every existing session. */
+async function loadSecrets() {
+    const idRaw = await readSecret<SerializedIdentity>(STORE_IDENTITY);
     if (idRaw) {
         identity = await deserializeIdentity(idRaw);
     } else {
         identity = await newIdentity();
-        await DataStore.set(STORE_IDENTITY, await serializeIdentity(identity));
+        await writeSecret(STORE_IDENTITY, await serializeIdentity(identity));
         log.info("Generated new identity keypair");
     }
 
-    // Sessions
-    const sessRaw = await DataStore.get<Record<string, SerializedSession>>(STORE_SESSIONS) ?? {};
+    const sessRaw = await readSecret<Record<string, SerializedSession>>(STORE_SESSIONS) ?? {};
     for (const [chId, s] of Object.entries(sessRaw)) {
         try { sessions.set(chId, await deserializeSession(s)); }
         catch (e) { log.warn("Bad stored session for", chId, e); }
     }
 
-    // Decrypted message cache
-    const decRaw = await DataStore.get<Record<string, string>>(STORE_DECRYPTED) ?? {};
+    const decRaw = await readSecret<Record<string, string>>(STORE_DECRYPTED) ?? {};
     for (const [mId, pt] of Object.entries(decRaw)) decryptedCache.set(mId, pt);
+}
 
-    // Enabled channels
-    const enRaw = await DataStore.get<Record<string, boolean>>(STORE_ENABLED) ?? {};
-    for (const [chId, on] of Object.entries(enRaw)) if (on) enabledChannels.add(chId);
-
-    // Processed handshake message IDs
-    const procRaw = await DataStore.get<string[]>(STORE_PROCESSED) ?? [];
-    for (const id of procRaw) processedHandshakeMsgs.add(id);
-
-    // Pinned peer identity keys
-    const keysRaw = await DataStore.get<Record<string, string>>(STORE_KNOWN_KEYS) ?? {};
-    for (const [uId, k] of Object.entries(keysRaw)) knownPeerKeys.set(uId, k);
+async function persistIdentity() {
+    if (!identity) return;
+    await writeSecret(STORE_IDENTITY, await serializeIdentity(identity));
 }
 
 async function persistSessions() {
     const out: Record<string, SerializedSession> = {};
     for (const [k, v] of sessions) out[k] = await serializeSession(v);
-    await DataStore.set(STORE_SESSIONS, out);
+    await writeSecret(STORE_SESSIONS, out);
 }
 
 async function persistDecrypted() {
     const out: Record<string, string> = {};
     for (const [k, v] of decryptedCache) out[k] = v;
-    await DataStore.set(STORE_DECRYPTED, out);
+    await writeSecret(STORE_DECRYPTED, out);
 }
 
 async function persistEnabled() {
@@ -210,6 +397,133 @@ async function persistEnabled() {
     for (const id of enabledChannels) out[id] = true;
     await DataStore.set(STORE_ENABLED, out);
 }
+
+// ------------------------------ Vault setup / teardown ------------------------------
+
+/** Retry the unlock after a dismissed prompt (the 🔑 lock button). */
+async function unlockNow(): Promise<boolean> {
+    const meta = await DataStore.get<unknown>(STORE_VAULT);
+    if (!isVaultMeta(meta)) {
+        // Nothing is actually encrypted — clear the flag so we stop refusing.
+        vaultLocked = false;
+        notifyStateChange();
+        return true;
+    }
+
+    if (!await unlockAndLoad(meta)) return false;
+    showToast("🔐 Unlocked — your encrypted messages are readable again.", Toasts.Type.SUCCESS);
+    return true;
+}
+
+async function enableVault() {
+    if (await DataStore.get(STORE_VAULT) !== undefined) return;   // already on
+
+    if (vaultLocked) {
+        showToast("🔐 Unlock your saved messages first.", Toasts.Type.FAILURE);
+        return;
+    }
+
+    // No verification step at creation time — any passphrase meeting the
+    // length minimum is acceptable, and the modal handles the confirm field.
+    const passphrase = await askPassphrase("create", async () => null);
+    if (passphrase === null) {
+        // Cancelled. `vaultActive` was never set, so the toggle springs back
+        // to off on the next render — no stored value to unwind.
+        showToast("🔐 Password setup cancelled — nothing was changed.");
+        return;
+    }
+
+    const { meta, key } = await makeVaultMeta(passphrase);
+    vaultKey = key;
+
+    // Metadata is published BEFORE the data is rewritten, so that an
+    // interruption fails in the recoverable direction. Metadata present with
+    // still-plaintext stores is self-healing: the next start asks for the
+    // passphrase, `readSecret` passes the plaintext records through untouched,
+    // and the next write encrypts them. The reverse order would leave
+    // encrypted blobs with no metadata to derive a key from — unreadable.
+    await DataStore.set(STORE_VAULT, meta);
+    await persistIdentity();
+    await persistSessions();
+    await persistDecrypted();
+    vaultActive = true;
+
+    showToast("🔐 Your saved messages are now password-protected. You'll be asked for the password when Discord starts.", Toasts.Type.SUCCESS);
+}
+
+async function disableVault() {
+    if (await DataStore.get(STORE_VAULT) === undefined) return;    // already off
+
+    if (vaultLocked || !vaultKey) {
+        if (!await unlockNow()) {
+            showToast("🔐 Enter your password first to turn this off.", Toasts.Type.FAILURE);
+            return;
+        }
+    }
+
+    // Drop the key first so the persist helpers emit plaintext.
+    vaultKey = null;
+    await persistIdentity();
+    await persistSessions();
+    await persistDecrypted();
+    await DataStore.del(STORE_VAULT);
+    vaultActive = false;
+
+    showToast("🔐 Password protection turned off. Your saved messages are no longer protected on this computer.");
+}
+
+/**
+ * The at-rest encryption toggle.
+ *
+ * Rendered as a COMPONENT rather than a BOOLEAN on purpose. Vencord's
+ * `BooleanSetting` seeds a local `useState` from the stored value once and
+ * never re-reads it, so cancelling the password prompt would revert the stored
+ * value while leaving the switch visibly ON until the panel was reopened. For a
+ * security setting that is the worst possible failure — it would tell the user
+ * their messages are protected when they are not.
+ *
+ * Driving the switch off `vaultActive` (does vault metadata exist?) removes the
+ * problem at the root: there is no second copy of the truth to drift, and
+ * cancelling simply leaves the switch where it was.
+ */
+const EncryptAtRestSetting = () => {
+    const [, setTick] = React.useState(0);
+    const [busy, setBusy] = React.useState(false);
+
+    React.useEffect(() => {
+        const fn = () => setTick(t => t + 1);
+        stateSubscribers.add(fn);
+        return () => { stateSubscribers.delete(fn); };
+    }, []);
+
+    return (
+        <FormSwitch
+            title="Password-protect saved messages"
+            description={
+                "Locks the messages this plugin has saved on your computer behind a password, " +
+                "so nobody who uses this computer can read them. You'll enter it once each time Discord starts. " +
+                "If you forget it, every message you've sent or received with this plugin is lost for good — there is no reset."
+            }
+            value={vaultActive}
+            disabled={busy}
+            onChange={want => {
+                setBusy(true);
+                (async () => {
+                    try {
+                        if (want) await enableVault();
+                        else await disableVault();
+                    } catch (e) {
+                        log.error("Vault reconfiguration failed", e);
+                        showToast(`🔐 Could not change the password setting: ${e}`, Toasts.Type.FAILURE);
+                    } finally {
+                        setBusy(false);
+                        notifyStateChange();
+                    }
+                })();
+            }}
+        />
+    );
+};
 
 async function persistProcessed() {
     await DataStore.set(STORE_PROCESSED, Array.from(processedHandshakeMsgs));
@@ -294,15 +608,31 @@ async function acceptInvite(channelId: string, s: Session): Promise<Session | nu
 // ------------------------------ Outgoing message hook ------------------------------
 
 const onSend: MessageSendListener = async (channelId, msg) => {
-    if (!identity) return;
-
-    // Don't molest our own handshake markers, etc.
+    // Don't molest our own handshake markers, etc. (any protocol version).
     if (isE2EEMessage(msg.content)) return;
 
     if (!enabledChannels.has(channelId)) return;
 
     const ch = ChannelStore.getChannel(channelId);
     if (!ch || !isDM(ch)) return;     // Only DMs are supported.
+
+    // Past this point the channel is E2EE-enabled, so every remaining branch
+    // must either encrypt or cancel. Bailing out with a bare `return` would
+    // hand the message back to Discord and send it in the clear — which is why
+    // the "no identity" check moved below the enabled check rather than
+    // guarding the whole listener.
+    if (vaultLocked) {
+        showToast(
+            "🔐 Locked. Click the 🔑 button and enter your password before sending here.",
+            Toasts.Type.FAILURE
+        );
+        return { cancel: true };
+    }
+
+    if (!identity) {
+        showToast("🔐 E2EE isn't ready yet — try again in a moment.", Toasts.Type.FAILURE);
+        return { cancel: true };
+    }
 
     const s = sessions.get(channelId) ?? emptySession();
 
@@ -351,6 +681,19 @@ const onSend: MessageSendListener = async (channelId, msg) => {
         rememberOwnPlaintext(wire, plaintext);
         await persistSessions();    // ratchet state advances on every send
     } catch (e) {
+        // Too long to fit in one Discord message. `encryptForSession` raises
+        // this before touching the ratchet, so there is nothing to roll back —
+        // the user can shorten the text and send again with no gap in the
+        // message numbering the peer sees.
+        if (e instanceof MessageTooLongError) {
+            showToast(
+                `🔐 Too long to send encrypted: ${e.wireLength}/${e.maxLength} characters once encrypted. ` +
+                `Remove about ${e.approxCharsToRemove} characters, or split it into two messages.`,
+                Toasts.Type.FAILURE
+            );
+            return { cancel: true };
+        }
+
         log.error("Encrypt failed", e);
         // As the handshake responder we cannot send until the peer's first
         // encrypted message arrives and primes our sending chain (the peer's
@@ -406,12 +749,34 @@ const onEdit: MessageEditListener = (channelId, messageId) => {
  *   ID (neither decrypted plaintext nor the processed-handshake set).
  */
 async function handleIncoming(channelId: string, message: any, optimistic = false): Promise<void> {
-    if (!identity || !message?.content) return;
+    if (!message?.content) return;
     const content: string = message.content;
     if (!isE2EEMessage(content)) return;
 
     const ch = ChannelStore.getChannel(channelId);
     if (!ch || !isDM(ch)) return;
+
+    // A v1 marker: either our own pre-upgrade history or a peer who hasn't
+    // updated. v2 key derivation is domain-separated from v1, so there is no
+    // way to read these — but labelling them beats rendering base64, and it
+    // tells the user what to ask the peer to do.
+    if (isLegacyE2EEMessage(content)) {
+        replaceContent(
+            channelId, message,
+            "🔐 [E2EE v1 message — this build speaks v2 only. If the peer is on v1, both of you need to update and re-handshake.]"
+        );
+        return;
+    }
+
+    // Locked vault: we can see that this is one of ours but hold no keys.
+    // Render a placeholder and touch nothing — in particular do not mark
+    // handshake messages processed, so they still take effect after unlocking.
+    if (vaultLocked) {
+        replaceContent(channelId, message, "🔐 [Locked — enter your password to read this message]");
+        return;
+    }
+
+    if (!identity) return;
 
     // Don't try to "decrypt" our own outgoing handshake / ciphertext (we
     // produced it, and our session state for sending is already advanced).
@@ -812,7 +1177,12 @@ const LockButton: ChatBarButtonFactory = ({ channel, isMainChat }) => {
 
     let icon = "🔓";
     let tooltip = "E2EE off — click to enable";
-    if (enabled && sess?.phase === "ready") {
+    if (vaultLocked) {
+        // Takes priority over everything: while locked we have no session state
+        // to report, and unlocking is the only action available.
+        icon = "🔑";
+        tooltip = "Locked — click and enter your password";
+    } else if (enabled && sess?.phase === "ready") {
         icon = "🔒";
         tooltip = `E2EE active${sess.safetyNum ? ` — safety #: ${sess.safetyNum}` : ""}`;
     } else if (enabled && sess?.phase === "init-sent") {
@@ -838,6 +1208,13 @@ const LockButton: ChatBarButtonFactory = ({ channel, isMainChat }) => {
 };
 
 async function onLockClicked(channelId: string) {
+    // While locked the button is an unlock affordance and nothing else —
+    // toggling E2EE would operate on empty state and destroy real sessions.
+    if (vaultLocked) {
+        await unlockNow();
+        return;
+    }
+
     const pending = sessions.get(channelId);
     if (enabledChannels.has(channelId)) {
         // Turn off + reset session.
@@ -884,13 +1261,17 @@ const settings = definePluginSettings({
         description: "Show the safety number in a notice when a session becomes ready.",
         default: true,
     },
+    encryptDataAtRest: {
+        type: OptionType.COMPONENT,
+        component: EncryptAtRestSetting,
+    },
 });
 
 // ------------------------------ Plugin definition ------------------------------
 
 export default definePlugin({
     name: "E2EE",
-    description: "End-to-end encryption for DMs using a Signal-style Double Ratchet (X25519 + HKDF + AES-GCM).",
+    description: "End-to-end encryption for DMs using a Signal-style Double Ratchet (X25519 + HKDF + AES-GCM). Protocol v2.",
     authors: [
         {
             name: "Tobi",
@@ -973,6 +1354,13 @@ export default definePlugin({
         removeMessagePreEditListener(onEdit);
         for (const [name, fn] of fluxHandlers) FluxDispatcher.unsubscribe(name as any, fn as any);
         fluxHandlers.length = 0;
+
+        // Drop the derived vault key so disabling the plugin actually re-locks
+        // the data instead of leaving it readable until Discord restarts.
+        // `vaultLocked` resets too, so a re-enable starts from a clean prompt.
+        vaultKey = null;
+        vaultLocked = false;
+
         log.info("E2EE plugin stopped");
     },
 });
