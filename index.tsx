@@ -463,7 +463,39 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
             if (alreadyProcessed) {
                 // Old INIT loaded from history; we already acted on it (or
                 // explicitly decided not to). Render but do NOT mutate state.
-                replaceContent(channelId, message, "🔐 [E2EE handshake invitation — historic]");
+                //
+                // "Acted on it" includes merely stashing it as a pending
+                // invitation, which is what a restart looks like: the session
+                // survives in storage while the message re-renders from
+                // scratch. That invitation is still live and acceptable, so
+                // don't call it historic. Match on the ephemeral key so only
+                // THIS INIT gets the live label — an older, superseded one
+                // still reads as historic.
+                const current = sessions.get(channelId);
+                let stillPending = false;
+                let keyChanged = false;
+                if (current?.phase === "init-recvd" && current.peerEphPub) {
+                    try {
+                        const parsed = parseInit(content);
+                        stillPending = b64encode(parsed.peerEphPub) === b64encode(current.peerEphPub);
+                        // A pending invitation's key is never pinned (pinning
+                        // happens on accept), so this still reports "changed"
+                        // across a restart — keep the warning attached to the
+                        // message rather than silently downgrading it.
+                        keyChanged = stillPending
+                            && checkPeerKey(message.author.id, parsed.peerIdPub) === "changed";
+                    } catch {
+                        // Malformed body — fall through to the historic label.
+                    }
+                }
+                replaceContent(
+                    channelId, message,
+                    !stillPending
+                        ? "🔐 [E2EE handshake invitation — historic]"
+                        : keyChanged
+                            ? "⚠️ [E2EE handshake invitation — peer's identity key has CHANGED since you last talked! Verify the safety number out of band before accepting.]"
+                            : "🔐 [E2EE handshake invitation — click the lock to accept]"
+                );
                 return;
             }
 
@@ -614,10 +646,16 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
                 replaceContent(channelId, message, "🔐 [E2EE reset — historic]");
                 return;
             }
+            // A reset means E2EE is OFF for this DM on BOTH sides. Dropping only
+            // the session would leave the channel enabled here, which shows the
+            // 🟡 "enabled, no session" lock and makes our next typed message
+            // silently fire a fresh handshake invitation at the peer.
             sessions.delete(channelId);
+            enabledChannels.delete(channelId);
             await persistSessions();
+            await persistEnabled();
             notifyStateChange();
-            replaceContent(channelId, message, "🔐 Peer reset the secure channel.");
+            replaceContent(channelId, message, "🔐 Peer reset the secure channel — E2EE is now off.");
             await markProcessedIfReal(message.id);
             return;
         }
