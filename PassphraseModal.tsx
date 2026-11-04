@@ -10,7 +10,9 @@
  */
 
 import { RenderModalProps } from "@vencord/discord-types";
-import { Forms, Modal, openModal, React, TextInput } from "@webpack/common";
+import { Heading } from "@components/Heading";
+import { Paragraph } from "@components/Paragraph";
+import { Modal, openModal, React, TextInput } from "@webpack/common";
 
 /** Short passphrases are the practical break against a GPU-parallel KDF. */
 export const MIN_PASSPHRASE_LENGTH = 12;
@@ -106,7 +108,7 @@ function PassphraseModal({ props, mode, verify, onDone }: PassphraseModalProps) 
             ]}
         >
             <div>
-                <Forms.FormTitle tag="h5">Password</Forms.FormTitle>
+                <Heading tag="h5">Password</Heading>
                 <TextInput
                     type="password"
                     autoFocus
@@ -120,7 +122,7 @@ function PassphraseModal({ props, mode, verify, onDone }: PassphraseModalProps) 
 
                 {creating && (
                     <>
-                        <Forms.FormTitle tag="h5">Type it again</Forms.FormTitle>
+                        <Heading tag="h5">Type it again</Heading>
                         <TextInput
                             type="password"
                             value={confirm}
@@ -133,15 +135,15 @@ function PassphraseModal({ props, mode, verify, onDone }: PassphraseModalProps) 
                 )}
 
                 {error && (
-                    <Forms.FormText style={{ color: "var(--text-danger)", marginTop: "6px" }}>
+                    <Paragraph style={{ color: "var(--text-danger)", marginTop: "6px" }}>
                         {error}
-                    </Forms.FormText>
+                    </Paragraph>
                 )}
 
                 {busy && (
-                    <Forms.FormText style={{ marginTop: "6px", opacity: 0.7 }}>
+                    <Paragraph style={{ marginTop: "6px", opacity: 0.7 }}>
                         Checking… this takes a second on purpose, to make guessing slow.
-                    </Forms.FormText>
+                    </Paragraph>
                 )}
             </div>
         </Modal>

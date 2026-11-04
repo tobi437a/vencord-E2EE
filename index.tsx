@@ -27,9 +27,10 @@ import { ChatBarButton, ChatBarButtonFactory } from "@api/ChatButtons";
 import { FormSwitch } from "@components/FormSwitch";
 import { updateMessage } from "@api/MessageUpdater";
 import {
-    showToast, Toasts,
+    showToast,
     FluxDispatcher, ChannelStore, MessageStore, UserStore, React,
 } from "@webpack/common";
+import type { ToastVariant } from "@vencord/discord-types";
 import { sendMessage } from "@utils/discord";
 import { Logger } from "@utils/Logger";
 
@@ -49,6 +50,10 @@ import {
     VaultMeta, WrongPassphraseError,
     isVaultBlob, isVaultMeta, makeVaultMeta, unlockVault, vaultDecrypt, vaultEncrypt,
 } from "./vault";
+
+function toast(text: string, variant: ToastVariant = "default") {
+    showToast({ text, variant });
+}
 
 // ------------------------------ Logger ------------------------------
 
@@ -411,7 +416,7 @@ async function unlockNow(): Promise<boolean> {
     }
 
     if (!await unlockAndLoad(meta)) return false;
-    showToast("🔐 Unlocked — your encrypted messages are readable again.", Toasts.Type.SUCCESS);
+    toast("🔐 Unlocked — your encrypted messages are readable again.", "success");
     return true;
 }
 
@@ -419,7 +424,7 @@ async function enableVault() {
     if (await DataStore.get(STORE_VAULT) !== undefined) return;   // already on
 
     if (vaultLocked) {
-        showToast("🔐 Unlock your saved messages first.", Toasts.Type.FAILURE);
+        toast("🔐 Unlock your saved messages first.", "critical");
         return;
     }
 
@@ -429,7 +434,7 @@ async function enableVault() {
     if (passphrase === null) {
         // Cancelled. `vaultActive` was never set, so the toggle springs back
         // to off on the next render — no stored value to unwind.
-        showToast("🔐 Password setup cancelled — nothing was changed.");
+        toast("🔐 Password setup cancelled — nothing was changed.");
         return;
     }
 
@@ -448,7 +453,7 @@ async function enableVault() {
     await persistDecrypted();
     vaultActive = true;
 
-    showToast("🔐 Your saved messages are now password-protected. You'll be asked for the password when Discord starts.", Toasts.Type.SUCCESS);
+    toast("🔐 Your saved messages are now password-protected. You'll be asked for the password when Discord starts.", "success");
 }
 
 async function disableVault() {
@@ -456,7 +461,7 @@ async function disableVault() {
 
     if (vaultLocked || !vaultKey) {
         if (!await unlockNow()) {
-            showToast("🔐 Enter your password first to turn this off.", Toasts.Type.FAILURE);
+            toast("🔐 Enter your password first to turn this off.", "critical");
             return;
         }
     }
@@ -469,7 +474,7 @@ async function disableVault() {
     await DataStore.del(STORE_VAULT);
     vaultActive = false;
 
-    showToast("🔐 Password protection turned off. Your saved messages are no longer protected on this computer.");
+    toast("🔐 Password protection turned off. Your saved messages are no longer protected on this computer.");
 }
 
 /**
@@ -514,7 +519,7 @@ const EncryptAtRestSetting = () => {
                         else await disableVault();
                     } catch (e) {
                         log.error("Vault reconfiguration failed", e);
-                        showToast(`🔐 Could not change the password setting: ${e}`, Toasts.Type.FAILURE);
+                        toast(`🔐 Could not change the password setting: ${e}`, "critical");
                     } finally {
                         setBusy(false);
                         notifyStateChange();
@@ -586,7 +591,7 @@ async function acceptInvite(channelId: string, s: Session): Promise<Session | nu
         sessions.delete(channelId);
         await persistSessions();
         notifyStateChange();
-        showToast("🔐 Handshake failed — invitation was corrupt.", Toasts.Type.FAILURE);
+        toast("🔐 Handshake failed — invitation was corrupt.", "critical");
         return null;
     }
     try {
@@ -600,7 +605,7 @@ async function acceptInvite(channelId: string, s: Session): Promise<Session | nu
         return newSession;
     } catch (e) {
         log.error("Failed to build ACK", e);
-        showToast("🔐 Handshake failed.", Toasts.Type.FAILURE);
+        toast("🔐 Handshake failed.", "critical");
         return null;
     }
 }
@@ -622,15 +627,15 @@ const onSend: MessageSendListener = async (channelId, msg) => {
     // the "no identity" check moved below the enabled check rather than
     // guarding the whole listener.
     if (vaultLocked) {
-        showToast(
+        toast(
             "🔐 Locked. Click the 🔑 button and enter your password before sending here.",
-            Toasts.Type.FAILURE
+            "critical"
         );
         return { cancel: true };
     }
 
     if (!identity) {
-        showToast("🔐 E2EE isn't ready yet — try again in a moment.", Toasts.Type.FAILURE);
+        toast("🔐 E2EE isn't ready yet — try again in a moment.", "critical");
         return { cancel: true };
     }
 
@@ -642,13 +647,13 @@ const onSend: MessageSendListener = async (channelId, msg) => {
     // doesn't accidentally send plaintext.
     if (s.phase === "none") {
         await startHandshake(channelId);
-        showToast("🔐 E2EE handshake sent. Your message wasn't sent — please retype it after the lock turns green.");
+        toast("🔐 E2EE handshake sent. Your message wasn't sent — please retype it after the lock turns green.");
         return { cancel: true };
     }
 
     if (s.phase === "init-sent") {
         // Still waiting on the peer's ACK. Refuse to send plaintext.
-        showToast("🔐 E2EE handshake still in progress. Wait for the lock to turn green.");
+        toast("🔐 E2EE handshake still in progress. Wait for the lock to turn green.");
         return { cancel: true };
     }
 
@@ -663,10 +668,10 @@ const onSend: MessageSendListener = async (channelId, msg) => {
             const safety = settings.store.showSafetyNumberOnReady
                 ? ` Safety #: ${sess.safetyNum}.`
                 : "";
-            showToast(
+            toast(
                 `🔐 E2EE handshake accepted.${safety} ` +
                 "Your message wasn't sent — please retype it after the lock turns green.",
-                Toasts.Type.SUCCESS
+                "success"
             );
         }
         return { cancel: true };
@@ -686,10 +691,10 @@ const onSend: MessageSendListener = async (channelId, msg) => {
         // the user can shorten the text and send again with no gap in the
         // message numbering the peer sees.
         if (e instanceof MessageTooLongError) {
-            showToast(
+            toast(
                 `🔐 Too long to send encrypted: ${e.wireLength}/${e.maxLength} characters once encrypted. ` +
                 `Remove about ${e.approxCharsToRemove} characters, or split it into two messages.`,
-                Toasts.Type.FAILURE
+                "critical"
             );
             return { cancel: true };
         }
@@ -698,11 +703,11 @@ const onSend: MessageSendListener = async (channelId, msg) => {
         // As the handshake responder we cannot send until the peer's first
         // encrypted message arrives and primes our sending chain (the peer's
         // client sends one automatically on ACK receipt).
-        showToast(
+        toast(
             String(e).includes("no sending chain")
                 ? "🔐 Waiting for the peer's first encrypted message — try again in a moment."
                 : "🔐 Encryption failed; aborting send.",
-            Toasts.Type.FAILURE
+            "critical"
         );
         return { cancel: true };
     }
@@ -732,9 +737,9 @@ const onEdit: MessageEditListener = (channelId, messageId) => {
 
     if (!enabledChannels.has(channelId) && !wasE2EE) return;
 
-    showToast(
+    toast(
         "🔐 Edit blocked: edits are not encrypted and would leak plaintext. Send a new message instead.",
-        Toasts.Type.FAILURE
+        "critical"
     );
     return { cancel: true };
 };
@@ -881,7 +886,7 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
                     current.phase === "init-sent" ? "outgoing handshake in flight"  :
                     /* init-recvd */                "another invitation already pending";
                 replaceContent(channelId, message, `🔐 [E2EE handshake invitation ignored — ${reason}]`);
-                showToast(
+                toast(
                     `🔐 Peer sent a handshake invitation, but ${reason}. ` +
                     "Toggle the lock off and on to reset if you want to accept it."
                 );
@@ -917,14 +922,14 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
                     : "🔐 [E2EE handshake invitation — click the lock to accept]"
             );
             if (keyChanged) {
-                showToast(
+                toast(
                     "⚠️ E2EE: peer wants to start a secure channel, but their identity key has " +
                     "CHANGED since you last talked. This could be a new install — or an attacker. " +
                     "Verify the safety number out of band before accepting!",
-                    Toasts.Type.FAILURE
+                    "critical"
                 );
             } else {
-                showToast(
+                toast(
                     "🔐 Peer wants to start a secure channel. Click the lock " +
                     "to accept (or ignore to decline)."
                 );
@@ -982,16 +987,16 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
             notifyStateChange();
             replaceContent(channelId, message, "🔐 E2EE secure channel established.");
             if (ackKeyChanged) {
-                showToast(
+                toast(
                     "⚠️ E2EE: secure channel established, but the peer's identity key has " +
                     "CHANGED since you last talked. Verify the safety number " +
                     `(${newSession.safetyNum}) out of band before trusting this channel!`,
-                    Toasts.Type.FAILURE
+                    "critical"
                 );
             } else if (settings.store.showSafetyNumberOnReady) {
-                showToast(
+                toast(
                     `🔐 Secure channel established. Safety #: ${newSession.safetyNum}`,
-                    Toasts.Type.SUCCESS
+                    "success"
                 );
             }
             await markProcessedIfReal(message.id);
@@ -1108,12 +1113,12 @@ function sendRaw(channelId: string, content: string) {
         .then((res: any) => {
             if (res?.ok === false) {
                 log.error("sendRaw: send failed", res);
-                showToast("🔐 Failed to send E2EE message — check your connection.", Toasts.Type.FAILURE);
+                toast("🔐 Failed to send E2EE message — check your connection.", "critical");
             }
         })
         .catch((e: any) => {
             log.error("sendRaw: send rejected", e);
-            showToast("🔐 Failed to send E2EE message — see console for details.", Toasts.Type.FAILURE);
+            toast("🔐 Failed to send E2EE message — see console for details.", "critical");
         });
 }
 
@@ -1224,7 +1229,7 @@ async function onLockClicked(channelId: string) {
         await persistSessions();
         notifyStateChange();
         if (had) sendRaw(channelId, PREFIX_RESET);
-        showToast(
+        toast(
             pending?.phase === "init-recvd"
                 ? "🔐 Handshake invitation declined."
                 : "🔐 E2EE disabled for this DM."
@@ -1242,13 +1247,13 @@ async function onLockClicked(channelId: string) {
                 const safety = settings.store.showSafetyNumberOnReady
                     ? ` Safety #: ${sess.safetyNum}.`
                     : "";
-                showToast(`🔐 E2EE handshake accepted.${safety}`, Toasts.Type.SUCCESS);
+                toast(`🔐 E2EE handshake accepted.${safety}`, "success");
             }
         } else if (!pending || pending.phase === "none") {
             // Start the handshake immediately instead of waiting for (and
             // eating) the user's first typed message.
             await startHandshake(channelId);
-            showToast("🔐 E2EE handshake sent — the lock turns green when the peer accepts.");
+            toast("🔐 E2EE handshake sent — the lock turns green when the peer accepts.");
         }
     }
 }
