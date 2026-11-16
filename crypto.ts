@@ -1,4 +1,10 @@
 /*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * crypto.ts — X25519 / HKDF / AES-GCM primitives + Double Ratchet
  *
  * Implements the core of Signal's Double Ratchet algorithm
@@ -62,8 +68,8 @@ export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 const X25519 = { name: "X25519" } as KeyAlgorithm;
 
 export interface KeyPair {
-    privateKey: CryptoKey;          // non-extractable in memory
-    publicKey: Uint8Array;          // 32-byte raw
+    privateKey: CryptoKey; // non-extractable in memory
+    publicKey: Uint8Array; // 32-byte raw
 }
 
 /** Generate a fresh X25519 keypair. */
@@ -153,9 +159,9 @@ export async function aeadDecrypt(mk: Uint8Array, ciphertext: Uint8Array, ad: Ui
 // ------------------------------ Message header ------------------------------
 
 export interface RatchetHeader {
-    dh: Uint8Array;     // sender's current ratchet pubkey (32B)
-    pn: number;         // # messages in previous sending chain
-    n: number;          // # in current chain
+    dh: Uint8Array; // sender's current ratchet pubkey (32B)
+    pn: number; // # messages in previous sending chain
+    n: number; // # in current chain
 }
 
 /** Wire format: [32 bytes dh][4 bytes pn BE][4 bytes n BE] = 40 bytes */
@@ -179,17 +185,17 @@ export function parseHeader(b: Uint8Array): RatchetHeader {
 
 // ------------------------------ Ratchet state ------------------------------
 
-const MAX_SKIP = 200;       // bound skipped message-key cache to avoid DoS
+const MAX_SKIP = 200; // bound skipped message-key cache to avoid DoS
 
 export interface RatchetState {
-    DHs: KeyPair | null;            // own current ratchet pair
-    DHr: Uint8Array | null;         // their last-seen ratchet pubkey
-    RK:  Uint8Array;                // root key
-    CKs: Uint8Array | null;         // sending chain
-    CKr: Uint8Array | null;         // receiving chain
-    Ns:  number;                    // # sent in current chain
-    Nr:  number;                    // # received in current chain
-    PN:  number;                    // # sent in previous chain
+    DHs: KeyPair | null; // own current ratchet pair
+    DHr: Uint8Array | null; // their last-seen ratchet pubkey
+    RK: Uint8Array; // root key
+    CKs: Uint8Array | null; // sending chain
+    CKr: Uint8Array | null; // receiving chain
+    Ns: number; // # sent in current chain
+    Nr: number; // # received in current chain
+    PN: number; // # sent in previous chain
     /** Skipped message keys, indexed by `b64(dh) + ":" + n`. */
     skipped: Record<string, Uint8Array>;
 }
@@ -254,7 +260,7 @@ export async function ratchetDecrypt(s: RatchetState, msg: Uint8Array, ad: Uint8
         const mk = c.skipped[skipKey];
         delete c.skipped[skipKey];
         const pt = await aeadDecrypt(mk, ct, concat(ad, headerBytes));
-        Object.assign(s, c);    // commit (consume the skipped key) only on success
+        Object.assign(s, c); // commit (consume the skipped key) only on success
         return pt;
     }
 

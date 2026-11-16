@@ -1,4 +1,10 @@
 /*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * vault.ts — passphrase-based encryption for the plugin's own stored data.
  *
  * Everything this plugin persists to IndexedDB is, by default, in the clear:

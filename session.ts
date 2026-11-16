@@ -1,4 +1,10 @@
 /*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * Per-channel session lifecycle, handshake protocol, persistence.
  *
  * ============================ PROTOCOL v2 ============================
@@ -53,21 +59,19 @@
 
 import { compressionAvailable, deflateRaw, inflateRaw } from "./compress";
 import {
-    KeyPair, RatchetState, SerializedState,
-    generateDH, dh, deriveHandshakeSecret,
-    ratchetInitAlice, ratchetInitBob, ratchetEncrypt, ratchetDecrypt,
-    serializeState, deserializeState,
-    exportPrivateJwk, importPrivateJwk,
-    b64encode, b64decode, bytesEqual, utf8, utf8dStrict, concat, safetyNumber,
+    b64decode, b64encode, bytesEqual, concat, deriveHandshakeSecret, deserializeState, dh,
+    exportPrivateJwk, generateDH, importPrivateJwk, KeyPair, ratchetDecrypt, ratchetEncrypt,
+    ratchetInitAlice, ratchetInitBob, RatchetState, safetyNumber, SerializedState,
+    serializeState, utf8, utf8dStrict,
 } from "./crypto";
 
 // ------------------------------ Wire markers ------------------------------
 
 export const PROTOCOL_VERSION = "v2";
 
-export const PREFIX_INIT  = "🔐⟨E2EE-INIT v2⟩";
-export const PREFIX_ACK   = "🔐⟨E2EE-ACK v2⟩";
-export const PREFIX_MSG   = "🔐⟨E2EE v2⟩";
+export const PREFIX_INIT = "🔐⟨E2EE-INIT v2⟩";
+export const PREFIX_ACK = "🔐⟨E2EE-ACK v2⟩";
+export const PREFIX_MSG = "🔐⟨E2EE v2⟩";
 export const PREFIX_RESET = "🔐⟨E2EE-RESET v2⟩";
 
 /** v1 markers. We never emit these; they exist so that a peer who hasn't
@@ -175,8 +179,8 @@ export async function unpackFrame(frame: Uint8Array): Promise<string> {
  *  guessing high would turn that into a failed send instead. */
 export const DISCORD_MAX_MESSAGE_LENGTH = 2000;
 
-const HEADER_BYTES = 40;      // 32B ratchet pubkey + 4B pn + 4B n
-const AEAD_TAG_BYTES = 16;    // AES-GCM tag
+const HEADER_BYTES = 40; // 32B ratchet pubkey + 4B pn + 4B n
+const AEAD_TAG_BYTES = 16; // AES-GCM tag
 
 /** Length of `btoa` output for `n` input bytes, padding included. */
 export function base64Length(n: number): number {
@@ -239,8 +243,8 @@ export class MessageTooLongError extends Error {
 // ------------------------------ Identity ------------------------------
 
 export interface Identity {
-    privateKey: CryptoKey;     // long-term X25519
-    publicKey: Uint8Array;     // 32 bytes
+    privateKey: CryptoKey; // long-term X25519
+    publicKey: Uint8Array; // 32 bytes
 }
 
 export interface SerializedIdentity {
@@ -380,10 +384,10 @@ export async function buildAck(
     //   dh2 = DH(myId,  peerEph)     [== Alice DH(EphA, IdB)]
     //   dh3 = DH(myEph, peerEph)
     //   dh4 = DH(myId,  peerId)
-    const dh1 = await dh(myEph.privateKey,    peerIdPub);
-    const dh2 = await dh(id.privateKey,       peerEphPub);
-    const dh3 = await dh(myEph.privateKey,    peerEphPub);
-    const dh4 = await dh(id.privateKey,       peerIdPub);
+    const dh1 = await dh(myEph.privateKey, peerIdPub);
+    const dh2 = await dh(id.privateKey, peerEphPub);
+    const dh3 = await dh(myEph.privateKey, peerEphPub);
+    const dh4 = await dh(id.privateKey, peerIdPub);
 
     // IMPORTANT: Both sides must mix the four DH outputs in the same order.
     // Match each of our outputs with the DH Alice computes over the same key
@@ -421,11 +425,11 @@ export async function handleAck(
     //   dh2 = DH(myEph, peerId)
     //   dh3 = DH(myEph, peerEph)
     //   dh4 = DH(myId,  peerId)
-    const dh1 = await dh(id.privateKey,        peerEphPub);
+    const dh1 = await dh(id.privateKey, peerEphPub);
     const dh2 = await dh(pendingEph.privateKey, peerIdPub);
     const dh3 = await dh(pendingEph.privateKey, peerEphPub);
-    const dh4 = await dh(id.privateKey,        peerIdPub);
-    const SK  = await deriveHandshakeSecret(dh1, dh2, dh3, dh4);
+    const dh4 = await dh(id.privateKey, peerIdPub);
+    const SK = await deriveHandshakeSecret(dh1, dh2, dh3, dh4);
 
     const ratchet = await ratchetInitAlice(SK, peerEphPub);
     return {

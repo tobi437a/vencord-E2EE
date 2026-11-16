@@ -1,4 +1,10 @@
 /*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * Test runner: `node tests/run.mjs` from the plugin folder.
  *
  * Exists mainly to pin the invocation. Passing `tests/` directly to

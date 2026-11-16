@@ -1,4 +1,10 @@
 /*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * Vencord plugin entry point.
  *
  * Wires the crypto + session layer into Discord:
@@ -12,8 +18,7 @@
  *     plaintext.
  */
 
-import definePlugin, { OptionType, IconComponent } from "@utils/types";
-import { definePluginSettings } from "@api/Settings";
+import { ChatBarButton, ChatBarButtonFactory } from "@api/ChatButtons";
 import { DataStore } from "@api/index";
 import {
     addMessagePreEditListener,
@@ -23,32 +28,26 @@ import {
     removeMessagePreEditListener,
     removeMessagePreSendListener,
 } from "@api/MessageEvents";
-import { ChatBarButton, ChatBarButtonFactory } from "@api/ChatButtons";
-import { FormSwitch } from "@components/FormSwitch";
 import { updateMessage } from "@api/MessageUpdater";
-import {
-    showToast,
-    FluxDispatcher, ChannelStore, MessageStore, UserStore, React,
-} from "@webpack/common";
-import type { ToastVariant } from "@vencord/discord-types";
+import { definePluginSettings } from "@api/Settings";
+import { FormSwitch } from "@components/FormSwitch";
 import { sendMessage } from "@utils/discord";
 import { Logger } from "@utils/Logger";
+import definePlugin, { IconComponent, OptionType } from "@utils/types";
+import type { ToastVariant } from "@vencord/discord-types";
+import { ChannelStore, FluxDispatcher, MessageStore, React, showToast, UserStore } from "@webpack/common";
 
 import { b64encode } from "./crypto";
 import { askPassphrase } from "./PassphraseModal";
 import {
-    Identity, Session, SerializedIdentity, SerializedSession,
-    emptySession, newIdentity,
-    serializeIdentity, deserializeIdentity,
-    serializeSession, deserializeSession,
-    isE2EEMessage, isLegacyE2EEMessage, encryptForSession, decryptForSession,
-    buildInit, parseInit, buildAck, handleAck,
-    MessageTooLongError,
-    PREFIX_INIT, PREFIX_ACK, PREFIX_MSG, PREFIX_RESET,
+    buildAck, buildInit, decryptForSession, deserializeIdentity, deserializeSession,
+    emptySession, encryptForSession, handleAck, Identity, isE2EEMessage, isLegacyE2EEMessage,
+    MessageTooLongError, newIdentity, parseInit, PREFIX_ACK, PREFIX_INIT, PREFIX_MSG, PREFIX_RESET,
+    SerializedIdentity, SerializedSession, serializeIdentity, serializeSession, Session,
 } from "./session";
 import {
-    VaultMeta, WrongPassphraseError,
     isVaultBlob, isVaultMeta, makeVaultMeta, unlockVault, vaultDecrypt, vaultEncrypt,
+    VaultMeta, WrongPassphraseError,
 } from "./vault";
 
 function toast(text: string, variant: ToastVariant = "default") {
@@ -77,13 +76,13 @@ const log = new Logger("E2EE");
  * a locked plugin couldn't tell an E2EE channel from a normal one and would
  * happily let a message meant for an encrypted DM go out in the clear.
  */
-const STORE_IDENTITY = "E2EE_identity_v2";       // SECRET
-const STORE_SESSIONS = "E2EE_sessions_v2";       // SECRET Record<channelId, SerializedSession>
-const STORE_DECRYPTED = "E2EE_decrypted_v2";     // SECRET Record<messageId, string>
-const STORE_ENABLED  = "E2EE_enabled_v2";        // public  Record<channelId, boolean>
-const STORE_PROCESSED = "E2EE_processed_v2";     // public  string[] of handshake message IDs
-const STORE_KNOWN_KEYS = "E2EE_knownKeys_v2";    // public  Record<userId, b64 identity pubkey>
-const STORE_VAULT = "E2EE_vault_v2";             // public  VaultMeta
+const STORE_IDENTITY = "E2EE_identity_v2"; // SECRET
+const STORE_SESSIONS = "E2EE_sessions_v2"; // SECRET Record<channelId, SerializedSession>
+const STORE_DECRYPTED = "E2EE_decrypted_v2"; // SECRET Record<messageId, string>
+const STORE_ENABLED = "E2EE_enabled_v2"; // public  Record<channelId, boolean>
+const STORE_PROCESSED = "E2EE_processed_v2"; // public  string[] of handshake message IDs
+const STORE_KNOWN_KEYS = "E2EE_knownKeys_v2"; // public  Record<userId, b64 identity pubkey>
+const STORE_VAULT = "E2EE_vault_v2"; // public  VaultMeta
 
 const LEGACY_STORE_IDENTITY = "E2EE_identity_v1";
 const LEGACY_STORE_SESSIONS = "E2EE_sessions_v1";
@@ -139,7 +138,7 @@ const MAX_PENDING_OWN = 200;
 
 /** Stash our own plaintext, evicting the oldest entries past the cap. */
 function rememberOwnPlaintext(wire: string, plaintext: string) {
-    pendingOwnPlaintext.delete(wire);      // re-insert so it counts as newest
+    pendingOwnPlaintext.delete(wire); // re-insert so it counts as newest
     pendingOwnPlaintext.set(wire, plaintext);
     while (pendingOwnPlaintext.size > MAX_PENDING_OWN) {
         const oldest = pendingOwnPlaintext.keys().next().value;
@@ -252,10 +251,10 @@ async function writeSecret(key: string, value: unknown): Promise<void> {
  * behind would quietly defeat at-rest encryption for anyone who turns it on.
  */
 async function migrateLegacyStores() {
-    if (await DataStore.get(STORE_IDENTITY) !== undefined) return;   // already on v2
+    if (await DataStore.get(STORE_IDENTITY) !== undefined) return; // already on v2
 
     const legacyIdentity = await DataStore.get<SerializedIdentity>(LEGACY_STORE_IDENTITY);
-    if (!legacyIdentity) return;                                     // fresh install
+    if (!legacyIdentity) return; // fresh install
 
     log.info("Migrating v1 data to protocol v2");
 
@@ -421,7 +420,7 @@ async function unlockNow(): Promise<boolean> {
 }
 
 async function enableVault() {
-    if (await DataStore.get(STORE_VAULT) !== undefined) return;   // already on
+    if (await DataStore.get(STORE_VAULT) !== undefined) return; // already on
 
     if (vaultLocked) {
         toast("🔐 Unlock your saved messages first.", "critical");
@@ -457,7 +456,7 @@ async function enableVault() {
 }
 
 async function disableVault() {
-    if (await DataStore.get(STORE_VAULT) === undefined) return;    // already off
+    if (await DataStore.get(STORE_VAULT) === undefined) return; // already off
 
     if (vaultLocked || !vaultKey) {
         if (!await unlockNow()) {
@@ -619,7 +618,7 @@ const onSend: MessageSendListener = async (channelId, msg) => {
     if (!enabledChannels.has(channelId)) return;
 
     const ch = ChannelStore.getChannel(channelId);
-    if (!ch || !isDM(ch)) return;     // Only DMs are supported.
+    if (!ch || !isDM(ch)) return; // Only DMs are supported.
 
     // Past this point the channel is E2EE-enabled, so every remaining branch
     // must either encrypt or cancel. Bailing out with a bare `return` would
@@ -684,7 +683,7 @@ const onSend: MessageSendListener = async (channelId, msg) => {
         msg.content = wire;
         // Remember our own plaintext so the echoed message renders readably.
         rememberOwnPlaintext(wire, plaintext);
-        await persistSessions();    // ratchet state advances on every send
+        await persistSessions(); // ratchet state advances on every send
     } catch (e) {
         // Too long to fit in one Discord message. `encryptForSession` raises
         // this before touching the ratchet, so there is nothing to roll back —
@@ -882,9 +881,9 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
             // accept a fresh handshake.
             if (current && current.phase !== "none") {
                 const reason =
-                    current.phase === "ready"     ? "secure channel already active" :
-                    current.phase === "init-sent" ? "outgoing handshake in flight"  :
-                    /* init-recvd */                "another invitation already pending";
+                    current.phase === "ready" ? "secure channel already active" :
+                    current.phase === "init-sent" ? "outgoing handshake in flight" :
+                    /* init-recvd */ "another invitation already pending";
                 replaceContent(channelId, message, `🔐 [E2EE handshake invitation ignored — ${reason}]`);
                 toast(
                     `🔐 Peer sent a handshake invitation, but ${reason}. ` +
@@ -1164,7 +1163,7 @@ const LockIcon: IconComponent = ({ height = 20, width = 20, className }) => (
 );
 
 const LockButton: ChatBarButtonFactory = ({ channel, isMainChat }) => {
-    if (!isMainChat) return null;            // skip forwarding modal etc.
+    if (!isMainChat) return null; // skip forwarding modal etc.
     if (!channel || !isDM(channel)) return null;
 
     // Subscribe to E2EE state changes so the icon/tooltip update the moment
@@ -1338,7 +1337,7 @@ export default definePlugin({
         const onLoad = (e: { channelId: string; messages: any[] }) => {
             const msgs = [...(e.messages ?? [])].sort((a, b) =>
                 a.id?.length !== b.id?.length
-                    ? a.id?.length - b.id?.length        // snowflakes: shorter id == older
+                    ? a.id?.length - b.id?.length // snowflakes: shorter id == older
                     : a.id < b.id ? -1 : 1
             );
             for (const m of msgs) enqueueIncoming(e.channelId, m);

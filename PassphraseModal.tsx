@@ -1,4 +1,10 @@
 /*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * PassphraseModal.tsx — prompts for the at-rest encryption passphrase.
  *
  * Two modes:
@@ -9,9 +15,9 @@
  *             a typo doesn't leave the plugin locked for the session.
  */
 
-import { RenderModalProps } from "@vencord/discord-types";
 import { Heading } from "@components/Heading";
 import { Paragraph } from "@components/Paragraph";
+import { RenderModalProps } from "@vencord/discord-types";
 import { Modal, openModal, React, TextInput } from "@webpack/common";
 
 /** Short passphrases are the practical break against a GPU-parallel KDF. */

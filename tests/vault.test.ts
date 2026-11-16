@@ -1,4 +1,10 @@
 /*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Vendicated and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * Tests for vault.ts — at-rest encryption of the plugin's stored data.
  *
  * PBKDF2 at the production iteration count takes a few hundred milliseconds per
