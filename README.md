@@ -58,7 +58,9 @@ Use a long password — a short one can be guessed by an attacker with your hard
 
 **Your friend needs the plugin too**, and on the same version. If they see gibberish, they either don't have it installed or need to update.
 
-**Only text is encrypted.** Images, files, voice messages, reactions, replies and embeds all go to Discord normally. Don't attach a photo and assume it's protected.
+**Only text is encrypted.** Images, files, voice messages, reactions, replies and embeds all go to Discord normally. Don't attach a photo and assume it's protected. While a file is attached in an encrypted DM the lock button shows a red 📎, and a warning pops up when you send it — the file still goes out, unencrypted.
+
+**How to tell what was encrypted.** Messages the plugin decrypted have a small green lock after the sender's name. A message that arrives in an encrypted DM *without* being encrypted gets a red "Not encrypted" notice underneath it. That notice only covers messages arriving while Discord is open, not older history.
 
 **Only one-on-one DMs.** Group DMs and server channels aren't supported.
 

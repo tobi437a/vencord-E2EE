@@ -20,6 +20,8 @@
 
 import { ChatBarButton, ChatBarButtonFactory } from "@api/ChatButtons";
 import { DataStore } from "@api/index";
+import { MessageAccessoryFactory } from "@api/MessageAccessories";
+import { MessageDecorationFactory } from "@api/MessageDecorations";
 import {
     addMessagePreEditListener,
     addMessagePreSendListener,
@@ -36,7 +38,10 @@ import { sendMessage } from "@utils/discord";
 import { Logger } from "@utils/Logger";
 import definePlugin, { IconComponent, OptionType } from "@utils/types";
 import type { ToastVariant } from "@vencord/discord-types";
-import { ChannelStore, FluxDispatcher, MessageStore, React, showToast, UserStore } from "@webpack/common";
+import {
+    ChannelStore, DraftType, FluxDispatcher, MessageStore, React, showToast, Tooltip,
+    UploadAttachmentStore, UserStore, useStateFromStores,
+} from "@webpack/common";
 
 import { askChoice } from "./ChoiceModal";
 import { b64encode, safetyNumber } from "./crypto";
@@ -182,6 +187,15 @@ const MAX_IN_FLIGHT = 50;
  * re-sends whatever it holds.
  */
 const failedSends = new Set<string>();
+
+/**
+ * IDs of messages that arrived in an E2EE-enabled DM without being encrypted.
+ * The lock badge only appears on the first message of a group, so a plaintext
+ * message slipped in right after an encrypted one would sit under a header that
+ * says "encrypted". These get their own notice on the message itself.
+ */
+const unencryptedInSecureChat = new Set<string>();
+const MAX_UNENCRYPTED_FLAGS = 500;
 
 /**
  * Copies of E2EE messages that arrived while the vault was locked, keyed by
@@ -716,7 +730,7 @@ async function acceptInvite(channelId: string, s: Session): Promise<Session | nu
 
 // ------------------------------ Outgoing message hook ------------------------------
 
-const onSend: MessageSendListener = async (channelId, msg) => {
+const onSend: MessageSendListener = async (channelId, msg, _options, props) => {
     // Don't molest our own handshake markers, etc. (any protocol version).
     if (isE2EEMessage(msg.content)) return;
 
@@ -734,7 +748,13 @@ const onSend: MessageSendListener = async (channelId, msg) => {
     // decrypted. An encrypt that overlaps a decrypt is how a message key gets
     // used twice (see serial.ts).
     try {
-        return await runExclusive(channelId, () => sendEncrypted(channelId, msg));
+        const result = await runExclusive(channelId, () => sendEncrypted(channelId, msg));
+        // Warn only: files go to Discord as they are, and blocking them would
+        // take away the only way to send one at all.
+        if (!result?.cancel && props?.hasAttachments) {
+            toast("⚠️ Your text was encrypted, but the attached file was NOT. Discord can see it.", "critical");
+        }
+        return result;
     } catch (e) {
         log.error("Send hook failed", e);
         toast("🔐 Something went wrong, so your message was not sent. It is still in the box.", "critical");
@@ -1380,6 +1400,10 @@ const LockButton: ChatBarButtonFactory = ({ channel, isMainChat }) => {
         stateSubscribers.add(fn);
         return () => { stateSubscribers.delete(fn); };
     }, []);
+    const pendingUploads = useStateFromStores(
+        [UploadAttachmentStore],
+        () => channel ? UploadAttachmentStore.getUploads(channel.id, DraftType.ChannelMessage).length : 0
+    );
 
     if (!isMainChat) return null; // skip forwarding modal etc.
     if (!channel || !isDM(channel)) return null;
@@ -1419,10 +1443,63 @@ const LockButton: ChatBarButtonFactory = ({ channel, isMainChat }) => {
         tooltip = "E2EE enabled — send a message to start handshake";
     }
 
+    // A file is waiting in the message box of an encrypted DM. Say so before
+    // it is sent; the toast in `onSend` only comes once it is on its way.
+    const fileWarning = enabled && pendingUploads > 0;
+    if (fileWarning) tooltip = "Attached files are NOT encrypted — only your text is";
+
     return (
         <ChatBarButton tooltip={tooltip} onClick={() => { onLockClicked(channel.id).catch(e => log.error("Lock click failed", e)); }}>
-            <span style={{ fontSize: "1.1em" }}>{icon}</span>
+            <span style={{ fontSize: "1.1em", position: "relative" }}>
+                {icon}
+                {fileWarning && (
+                    <span
+                        style={{
+                            position: "absolute", top: "-7px", right: "-9px",
+                            fontSize: "0.6em", lineHeight: 1, padding: "2px 3px", borderRadius: "8px",
+                            background: "var(--status-danger, #da373c)",
+                        }}
+                    >
+                        📎
+                    </span>
+                )}
+            </span>
         </ChatBarButton>
+    );
+};
+
+/** Lock next to the author's name on messages this plugin decrypted. */
+const EncryptedBadge: MessageDecorationFactory = ({ message }) => {
+    if (!message || !decryptedCache.has(message.id)) return null;
+    return (
+        <Tooltip text="End-to-end encrypted">
+            {tooltipProps => (
+                <span
+                    {...tooltipProps}
+                    style={{ display: "inline-flex", verticalAlign: "middle", marginLeft: "4px", color: "var(--text-positive, #23a55a)" }}
+                >
+                    <LockIcon width={14} height={14} />
+                </span>
+            )}
+        </Tooltip>
+    );
+};
+
+/** Notice under a message that arrived unencrypted in an E2EE-enabled DM. */
+const UnencryptedNotice: MessageAccessoryFactory = ({ message }) => {
+    if (!message || !unencryptedInSecureChat.has(message.id)) return null;
+    return (
+        <div
+            style={{
+                marginTop: "4px", padding: "4px 8px", width: "fit-content",
+                fontSize: "12px", lineHeight: "16px", borderRadius: "4px",
+                color: "var(--text-danger, #f23f43)",
+                background: "color-mix(in srgb, var(--status-danger, #da373c) 12%, transparent)",
+                borderLeft: "3px solid var(--status-danger, #da373c)",
+            }}
+        >
+            ⚠️ Not encrypted — this message did not come through the secure channel.
+        </div>
     );
 };
 
@@ -1614,10 +1691,13 @@ export default definePlugin({
             id: 1496025810870472744n
         }
     ],
-    dependencies: ["ChatInputButtonAPI", "MessageEventsAPI", "MessageUpdaterAPI"],
+    dependencies: ["ChatInputButtonAPI", "MessageEventsAPI", "MessageUpdaterAPI", "MessageDecorationsAPI", "MessageAccessoriesAPI"],
     settings,
 
     // Registered/unregistered automatically by the PluginManager.
+    renderMessageDecoration: EncryptedBadge,
+    renderMessageAccessory: UnencryptedNotice,
+
     chatBarButton: {
         icon: LockIcon,
         render: LockButton,
@@ -1640,6 +1720,13 @@ export default definePlugin({
         // sends the real message back. Both have to render as plaintext; only
         // the second one carries an ID worth remembering.
         const onCreate = (e: { channelId: string; message: any; optimistic?: boolean }) => {
+            // Types 0 and 19 are ordinary messages and replies; call and pin
+            // notices are Discord's own and have nothing to encrypt.
+            const isChat = e.message?.type === 0 || e.message?.type === 19;
+            if (isChat && enabledChannels.has(e.channelId) && !isE2EEMessage(e.message.content ?? "")) {
+                unencryptedInSecureChat.add(e.message.id);
+                trimOldest(unencryptedInSecureChat, MAX_UNENCRYPTED_FLAGS);
+            }
             enqueueIncoming(e.channelId, [e.message], e.optimistic === true);
         };
         subscribe("MESSAGE_CREATE", onCreate);
