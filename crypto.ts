@@ -68,7 +68,7 @@ export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 const X25519 = { name: "X25519" } as KeyAlgorithm;
 
 export interface KeyPair {
-    privateKey: CryptoKey; // non-extractable in memory
+    privateKey: CryptoKey; // extractable, so ratchet state can be persisted as JWK
     publicKey: Uint8Array; // 32-byte raw
 }
 
@@ -333,18 +333,25 @@ export interface SerializedState {
 }
 
 export async function serializeState(s: RatchetState): Promise<SerializedState> {
-    return {
-        DHs: s.DHs
-            ? { jwk: await exportPrivateJwk(s.DHs.privateKey), pub: b64encode(s.DHs.publicKey) }
-            : null,
+    // Read every field before the first await. Exporting the private key
+    // yields, and a ratchet step committing in that gap would otherwise leave
+    // us with one chain's private key next to another chain's root key.
+    const { DHs } = s;
+    const rest = {
         DHr: s.DHr ? b64encode(s.DHr) : null,
-        RK:  b64encode(s.RK),
+        RK: b64encode(s.RK),
         CKs: s.CKs ? b64encode(s.CKs) : null,
         CKr: s.CKr ? b64encode(s.CKr) : null,
         Ns: s.Ns, Nr: s.Nr, PN: s.PN,
         skipped: Object.fromEntries(
             Object.entries(s.skipped).map(([k, v]) => [k, b64encode(v)])
         ),
+    };
+    return {
+        DHs: DHs
+            ? { jwk: await exportPrivateJwk(DHs.privateKey), pub: b64encode(DHs.publicKey) }
+            : null,
+        ...rest,
     };
 }
 

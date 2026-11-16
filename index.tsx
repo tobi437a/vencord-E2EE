@@ -910,6 +910,7 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
                 pendingEph: null,
                 ratchet: null,
                 safetyNum: null,
+                untrustedKey: false,
             };
             sessions.set(channelId, pending);
             await persistSessions();

@@ -26,9 +26,10 @@
  *
  *   🔐⟨E2EE-RESET v2⟩
  *       Either side can send this to tear down the session (e.g. if decryption
- *       starts failing because state got out of sync). The other side will
- *       discard its session and the next encrypted send will trigger a new
- *       handshake.
+ *       starts failing because state got out of sync). It carries no proof of
+ *       who sent it, so the other side discards its session but does NOT go
+ *       back to plaintext: the DM stays closed ("peer-reset") until that user
+ *       chooses to re-encrypt or to carry on unencrypted.
  *
  * Changes from v1:
  *   - Message bodies are framed with a 1-byte codec flag and may be DEFLATE
@@ -277,8 +278,12 @@ export async function newIdentity(): Promise<Identity> {
  *                    point an ACK is constructed and the ratchet is set up.
  *                    This prevents auto-ACK in response to spammed INITs.
  *   - "ready":       Double Ratchet up, can send/recv encrypted messages.
+ *   - "peer-reset":  The peer tore the session down. RESET is unauthenticated,
+ *                    so it must not be able to switch a DM back to plaintext
+ *                    by itself: this phase holds the channel closed (nothing
+ *                    can be sent) until the user picks what happens next.
  */
-export type SessionPhase = "none" | "init-sent" | "init-recvd" | "ready";
+export type SessionPhase = "none" | "init-sent" | "init-recvd" | "ready" | "peer-reset";
 
 export interface Session {
     phase: SessionPhase;
@@ -291,8 +296,12 @@ export interface Session {
     pendingEph: KeyPair | null;
     /** Live ratchet state, present iff phase === "ready". */
     ratchet: RatchetState | null;
-    /** Cached safety number (computed on first transition to ready). */
+    /** Safety number for `peerIdPub`. Set as soon as that key is known, so it
+     *  can be compared before an invitation is accepted, not only after. */
     safetyNum: string | null;
+    /** The peer's identity key differs from the one pinned for them and the
+     *  user has not confirmed the new one yet. Nothing is sent meanwhile. */
+    untrustedKey: boolean;
 }
 
 export interface SerializedSession {
@@ -302,18 +311,29 @@ export interface SerializedSession {
     pendingEph: { jwk: JsonWebKey; pub: string } | null;
     ratchet: SerializedState | null;
     safetyNum: string | null;
+    /** Absent in records written before this field existed. */
+    untrustedKey?: boolean;
 }
 
 export async function serializeSession(s: Session): Promise<SerializedSession> {
-    return {
+    // Same rule as `serializeState`: take the whole snapshot before yielding.
+    // `serializeState` reads its fields synchronously when called, so starting
+    // it here (and awaiting it below) is what keeps the two halves consistent.
+    const { pendingEph } = s;
+    const ratchet = s.ratchet ? serializeState(s.ratchet) : null;
+    const rest = {
         phase: s.phase,
         peerIdPub: s.peerIdPub ? b64encode(s.peerIdPub) : null,
         peerEphPub: s.peerEphPub ? b64encode(s.peerEphPub) : null,
-        pendingEph: s.pendingEph
-            ? { jwk: await exportPrivateJwk(s.pendingEph.privateKey), pub: b64encode(s.pendingEph.publicKey) }
-            : null,
-        ratchet: s.ratchet ? await serializeState(s.ratchet) : null,
         safetyNum: s.safetyNum,
+        untrustedKey: s.untrustedKey,
+    };
+    return {
+        ...rest,
+        pendingEph: pendingEph
+            ? { jwk: await exportPrivateJwk(pendingEph.privateKey), pub: b64encode(pendingEph.publicKey) }
+            : null,
+        ratchet: await ratchet,
     };
 }
 
@@ -327,6 +347,7 @@ export async function deserializeSession(j: SerializedSession): Promise<Session>
             : null,
         ratchet: j.ratchet ? await deserializeState(j.ratchet) : null,
         safetyNum: j.safetyNum,
+        untrustedKey: j.untrustedKey ?? false,
     };
 }
 
@@ -335,6 +356,7 @@ export function emptySession(): Session {
         phase: "none",
         peerIdPub: null, peerEphPub: null,
         pendingEph: null, ratchet: null, safetyNum: null,
+        untrustedKey: false,
     };
 }
 
@@ -407,6 +429,7 @@ export async function buildAck(
         pendingEph: null,
         ratchet,
         safetyNum: await safetyNumber(id.publicKey, peerIdPub),
+        untrustedKey: false,
     };
     const wire = PREFIX_ACK + encodeHandshakeBody(id.publicKey, myEph.publicKey);
     return { wire, session };
@@ -439,6 +462,7 @@ export async function handleAck(
         pendingEph: null,
         ratchet,
         safetyNum: await safetyNumber(id.publicKey, peerIdPub),
+        untrustedKey: false,
     };
 }
 
