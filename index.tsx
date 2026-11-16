@@ -31,14 +31,17 @@ import {
 import { updateMessage } from "@api/MessageUpdater";
 import { definePluginSettings } from "@api/Settings";
 import { FormSwitch } from "@components/FormSwitch";
+import { Paragraph } from "@components/Paragraph";
 import { sendMessage } from "@utils/discord";
 import { Logger } from "@utils/Logger";
 import definePlugin, { IconComponent, OptionType } from "@utils/types";
 import type { ToastVariant } from "@vencord/discord-types";
 import { ChannelStore, FluxDispatcher, MessageStore, React, showToast, UserStore } from "@webpack/common";
 
-import { b64encode } from "./crypto";
+import { askChoice } from "./ChoiceModal";
+import { b64encode, safetyNumber } from "./crypto";
 import { askPassphrase } from "./PassphraseModal";
+import { runExclusive, serialWriter } from "./serial";
 import {
     buildAck, buildInit, decryptForSession, deserializeIdentity, deserializeSession,
     emptySession, encryptForSession, handleAck, Identity, isE2EEMessage, isLegacyE2EEMessage,
@@ -136,15 +139,19 @@ const processedHandshakeMsgs = new Set<string>();
 const pendingOwnPlaintext = new Map<string, string>();
 const MAX_PENDING_OWN = 200;
 
+/** Drop the oldest entries of an insertion-ordered collection past `max`. */
+function trimOldest(collection: Map<string, unknown> | Set<string>, max: number) {
+    for (const key of collection.keys()) {
+        if (collection.size <= max) break;
+        collection.delete(key);
+    }
+}
+
 /** Stash our own plaintext, evicting the oldest entries past the cap. */
 function rememberOwnPlaintext(wire: string, plaintext: string) {
     pendingOwnPlaintext.delete(wire); // re-insert so it counts as newest
     pendingOwnPlaintext.set(wire, plaintext);
-    while (pendingOwnPlaintext.size > MAX_PENDING_OWN) {
-        const oldest = pendingOwnPlaintext.keys().next().value;
-        if (oldest === undefined) break;
-        pendingOwnPlaintext.delete(oldest);
-    }
+    trimOldest(pendingOwnPlaintext, MAX_PENDING_OWN);
 }
 
 /** Look up our own plaintext for a wire string, refreshing its position so a
@@ -168,16 +175,34 @@ function recallOwnPlaintext(wire: string): string | undefined {
 const inFlightWire = new Map<string, string>();
 const MAX_IN_FLIGHT = 50;
 
+/**
+ * Optimistic IDs of sends that failed. The failure can be announced before the
+ * queued rewrite of that same optimistic echo has run; without this record the
+ * late rewrite would put the plaintext back into a message whose Retry button
+ * re-sends whatever it holds.
+ */
+const failedSends = new Set<string>();
+
+/**
+ * Copies of E2EE messages that arrived while the vault was locked, keyed by
+ * message ID. Their store copies are overwritten with a placeholder, so the
+ * original has to be kept somewhere for the unlock to have anything to decrypt.
+ */
+const lockedMessages = new Map<string, { channelId: string; message: any; }>();
+const MAX_LOCKED_MESSAGES = 500;
+
 /** Cap so the persisted plaintext cache can't grow without bound.
  *  Maps iterate in insertion order, so this evicts the oldest entries. */
 const MAX_DECRYPTED_CACHE = 5000;
+/** The cache holds plaintext that has not been written to disk yet. */
+let decryptedDirty = false;
+/** A received message changed state in memory and `persistState` is still owed. */
+let unsavedIncoming = false;
 function cacheDecrypted(messageId: string, plaintext: string) {
     decryptedCache.set(messageId, plaintext);
-    while (decryptedCache.size > MAX_DECRYPTED_CACHE) {
-        const oldest = decryptedCache.keys().next().value;
-        if (oldest === undefined) break;
-        decryptedCache.delete(oldest);
-    }
+    trimOldest(decryptedCache, MAX_DECRYPTED_CACHE);
+    decryptedDirty = true;
+    unsavedIncoming = true;
 }
 
 // React subscribers that want to re-render when E2EE state changes.
@@ -207,6 +232,13 @@ let vaultLocked = false;
  * see `EncryptAtRestSetting` for why that distinction matters.
  */
 let vaultActive = false;
+/**
+ * True once the SECRET stores have been read into memory. Until then the
+ * in-memory maps are empty for a reason other than "there is no data" — the
+ * plugin has not started, or the unlock failed part-way — and saving them
+ * would replace real sessions and messages with nothing.
+ */
+let secretsLoaded = false;
 
 /** Read a SECRET store, transparently unwrapping it if it's vault-encrypted. */
 async function readSecret<T>(key: string): Promise<T | undefined> {
@@ -227,8 +259,9 @@ async function writeSecret(key: string, value: unknown): Promise<void> {
     // Refusing to write while locked is what keeps a dismissed unlock prompt
     // from being destructive. In that state every in-memory map is empty, so an
     // unguarded write would serialise "no identity, no sessions, no cached
-    // messages" straight over the user's real (encrypted) data.
-    if (vaultLocked) return;
+    // messages" straight over the user's real (encrypted) data. The same goes
+    // for any other moment the maps have not been loaded yet.
+    if (vaultLocked || !secretsLoaded) return;
     await DataStore.set(key, vaultKey ? await vaultEncrypt(vaultKey, value) : value);
 }
 
@@ -333,11 +366,12 @@ async function loadAll() {
         // stall Vencord's startup, and the modal needs Discord's UI mounted to
         // render at all — which it may not be this early. If the prompt never
         // appears, the 🔑 lock button is the retry path.
-        void unlockAndLoad(meta);
+        unlockAndLoad(meta).catch(e => log.error("Unlock failed", e));
         return;
     }
 
     await loadSecrets();
+    await ensureIdentity();
 }
 
 /** Prompt for the passphrase and, on success, load what the locked start
@@ -349,9 +383,22 @@ async function unlockAndLoad(meta: VaultMeta): Promise<boolean> {
         return false;
     }
 
+    // The lock comes off only once everything has been read. If a store turns
+    // out to be unreadable the plugin stays locked, which keeps refusing both
+    // sends and writes, instead of running unlocked on half-loaded state.
     vaultKey = key;
+    try {
+        await loadSecrets();
+    } catch (e) {
+        vaultKey = null;
+        log.error("Could not read the saved E2EE data", e);
+        toast("🔐 Your password was right, but the saved data could not be read. See the console for details.", "critical");
+        return false;
+    }
     vaultLocked = false;
-    await loadSecrets();
+    await ensureIdentity();
+
+    replayLockedMessages();
     notifyStateChange();
     return true;
 }
@@ -361,22 +408,28 @@ async function unlockAndLoad(meta: VaultMeta): Promise<boolean> {
  *  silently orphaning every existing session. */
 async function loadSecrets() {
     const idRaw = await readSecret<SerializedIdentity>(STORE_IDENTITY);
-    if (idRaw) {
-        identity = await deserializeIdentity(idRaw);
-    } else {
-        identity = await newIdentity();
-        await writeSecret(STORE_IDENTITY, await serializeIdentity(identity));
-        log.info("Generated new identity keypair");
-    }
-
     const sessRaw = await readSecret<Record<string, SerializedSession>>(STORE_SESSIONS) ?? {};
+    const decRaw = await readSecret<Record<string, string>>(STORE_DECRYPTED) ?? {};
+
+    if (idRaw) identity = await deserializeIdentity(idRaw);
+
     for (const [chId, s] of Object.entries(sessRaw)) {
         try { sessions.set(chId, await deserializeSession(s)); }
         catch (e) { log.warn("Bad stored session for", chId, e); }
     }
 
-    const decRaw = await readSecret<Record<string, string>>(STORE_DECRYPTED) ?? {};
     for (const [mId, pt] of Object.entries(decRaw)) decryptedCache.set(mId, pt);
+
+    secretsLoaded = true;
+}
+
+/** First run: there is no identity yet, so make one. Runs after `loadSecrets`
+ *  and with the vault unlocked, so the new key can actually be saved. */
+async function ensureIdentity() {
+    if (identity) return;
+    identity = await newIdentity();
+    await persistIdentity();
+    log.info("Generated new identity keypair");
 }
 
 async function persistIdentity() {
@@ -384,17 +437,28 @@ async function persistIdentity() {
     await writeSecret(STORE_IDENTITY, await serializeIdentity(identity));
 }
 
-async function persistSessions() {
-    const out: Record<string, SerializedSession> = {};
-    for (const [k, v] of sessions) out[k] = await serializeSession(v);
-    await writeSecret(STORE_SESSIONS, out);
-}
+/**
+ * Save the sessions and, if it changed, the plaintext cache.
+ *
+ * Both are read in the same synchronous step and the plaintext is written
+ * first. A session that has consumed a message key must never reach disk ahead
+ * of that message's plaintext: the key cannot be derived a second time, so a
+ * crash in between would leave the message unreadable for good. Written the
+ * other way round, a crash only means decrypting it again.
+ */
+const persistState = serialWriter(async () => {
+    const plaintext = decryptedDirty ? Object.fromEntries(decryptedCache) : null;
+    decryptedDirty = false;
+    const pending = Array.from(sessions, async ([id, s]) => [id, await serializeSession(s)] as const);
 
-async function persistDecrypted() {
-    const out: Record<string, string> = {};
-    for (const [k, v] of decryptedCache) out[k] = v;
-    await writeSecret(STORE_DECRYPTED, out);
-}
+    try {
+        if (plaintext) await writeSecret(STORE_DECRYPTED, plaintext);
+    } catch (e) {
+        decryptedDirty = true;
+        throw e;
+    }
+    await writeSecret(STORE_SESSIONS, Object.fromEntries(await Promise.all(pending)));
+});
 
 async function persistEnabled() {
     const out: Record<string, boolean> = {};
@@ -427,6 +491,14 @@ async function enableVault() {
         return;
     }
 
+    // The settings panel also opens for a plugin that is switched off. Nothing
+    // has been loaded then, and re-saving "everything" under the new password
+    // would overwrite the real sessions and messages with empty ones.
+    if (!secretsLoaded) {
+        toast("🔐 Turn the E2EE plugin on first, then set a password.", "critical");
+        return;
+    }
+
     // No verification step at creation time — any passphrase meeting the
     // length minimum is acceptable, and the modal handles the confirm field.
     const passphrase = await askPassphrase("create", async () => null);
@@ -448,8 +520,8 @@ async function enableVault() {
     // encrypted blobs with no metadata to derive a key from — unreadable.
     await DataStore.set(STORE_VAULT, meta);
     await persistIdentity();
-    await persistSessions();
-    await persistDecrypted();
+    decryptedDirty = true;
+    await persistState();
     vaultActive = true;
 
     toast("🔐 Your saved messages are now password-protected. You'll be asked for the password when Discord starts.", "success");
@@ -468,8 +540,8 @@ async function disableVault() {
     // Drop the key first so the persist helpers emit plaintext.
     vaultKey = null;
     await persistIdentity();
-    await persistSessions();
-    await persistDecrypted();
+    decryptedDirty = true;
+    await persistState();
     await DataStore.del(STORE_VAULT);
     vaultActive = false;
 
@@ -575,9 +647,42 @@ async function startHandshake(channelId: string) {
     if (!identity) return;
     const { wire, eph } = await buildInit(identity);
     sessions.set(channelId, { ...emptySession(), phase: "init-sent", pendingEph: eph });
-    await persistSessions();
+    await persistState();
     notifyStateChange();
     sendRaw(channelId, wire);
+}
+
+/** True if this session's peer key differs from the one pinned for the peer. */
+function hasChangedKey(channelId: string, s: Session): boolean {
+    const peerId = getPeerUserId(channelId);
+    return !!peerId && !!s.peerIdPub && checkPeerKey(peerId, s.peerIdPub) === "changed";
+}
+
+/**
+ * Send the first encrypted message of a new session.
+ *
+ * By Double Ratchet design the responder has no sending chain until the
+ * initiator's first encrypted message reaches them and triggers their DH
+ * ratchet, so until we send something all of their sends would fail. It
+ * decrypts to a visible "channel established" note on their end.
+ */
+async function sendPrime(channelId: string, s: Session) {
+    const text = "🔐 Secure channel established.";
+    const wire = await encryptForSession(s, text);
+    rememberOwnPlaintext(wire, text);
+    await persistState();
+    sendRaw(channelId, wire);
+}
+
+/** Turn E2EE off for a DM and tell the peer, unless they are the one who ended it. */
+async function turnOff(channelId: string) {
+    const previous = sessions.get(channelId);
+    enabledChannels.delete(channelId);
+    sessions.delete(channelId);
+    await persistEnabled();
+    await persistState();
+    notifyStateChange();
+    if (previous && previous.phase !== "none" && previous.phase !== "peer-reset") sendRaw(channelId, PREFIX_RESET);
 }
 
 /** Responder side: accept a pending invitation — derive the session, pin the
@@ -588,7 +693,7 @@ async function acceptInvite(channelId: string, s: Session): Promise<Session | nu
     if (!s.peerIdPub || !s.peerEphPub) {
         log.error("init-recvd phase missing peer keys", channelId);
         sessions.delete(channelId);
-        await persistSessions();
+        await persistState();
         notifyStateChange();
         toast("🔐 Handshake failed — invitation was corrupt.", "critical");
         return null;
@@ -596,7 +701,7 @@ async function acceptInvite(channelId: string, s: Session): Promise<Session | nu
     try {
         const { wire, session: newSession } = await buildAck(identity, s.peerIdPub, s.peerEphPub);
         sessions.set(channelId, newSession);
-        await persistSessions();
+        await persistState();
         const peerId = getPeerUserId(channelId);
         if (peerId) await pinPeerKey(peerId, s.peerIdPub);
         notifyStateChange();
@@ -620,11 +725,32 @@ const onSend: MessageSendListener = async (channelId, msg) => {
     const ch = ChannelStore.getChannel(channelId);
     if (!ch || !isDM(ch)) return; // Only DMs are supported.
 
-    // Past this point the channel is E2EE-enabled, so every remaining branch
-    // must either encrypt or cancel. Bailing out with a bare `return` would
-    // hand the message back to Discord and send it in the clear — which is why
-    // the "no identity" check moved below the enabled check rather than
-    // guarding the whole listener.
+    // Past this point the channel is E2EE-enabled, so the message must either
+    // be encrypted or cancelled. That includes failures: Vencord logs a
+    // listener that throws and then sends the message as typed, so an error
+    // escaping from here would put the plaintext on the wire.
+    //
+    // The work runs in the channel's queue, behind any message currently being
+    // decrypted. An encrypt that overlaps a decrypt is how a message key gets
+    // used twice (see serial.ts).
+    try {
+        return await runExclusive(channelId, () => sendEncrypted(channelId, msg));
+    } catch (e) {
+        log.error("Send hook failed", e);
+        toast("🔐 Something went wrong, so your message was not sent. It is still in the box.", "critical");
+        return { cancel: true };
+    }
+};
+
+async function sendEncrypted(channelId: string, msg: { content: string; }): Promise<{ cancel: boolean; } | void> {
+    // The lock may have been turned off while this send was waiting its turn.
+    // Sending now would be unencrypted, which is not what Enter meant when it
+    // was pressed, so ask for a second one.
+    if (!enabledChannels.has(channelId)) {
+        toast("🔐 Encryption was just turned off here. Press Enter again to send without it.");
+        return { cancel: true };
+    }
+
     if (vaultLocked) {
         toast(
             "🔐 Locked. Click the 🔑 button and enter your password before sending here.",
@@ -640,39 +766,66 @@ const onSend: MessageSendListener = async (channelId, msg) => {
 
     const s = sessions.get(channelId) ?? emptySession();
 
-    // No session yet? Kick off handshake. (Normally the lock click already did
-    // this; this path remains for e.g. a peer RESET wiping the session while
-    // the channel stayed enabled.) The typed message is discarded so the user
-    // doesn't accidentally send plaintext.
+    // A cancelled send leaves the text in the message box, so every refusal
+    // below tells the user to press Enter again rather than to retype.
+
+    if (s.phase === "peer-reset") {
+        toast(
+            "🔐 Your friend ended the encrypted chat, so nothing was sent. " +
+            "Click the ⚠️ button to choose what happens next.",
+            "critical"
+        );
+        return { cancel: true };
+    }
+
+    // No session yet? Kick off handshake. Normally the lock click already did
+    // this; the path remains for a channel that is enabled without a session.
     if (s.phase === "none") {
         await startHandshake(channelId);
-        toast("🔐 E2EE handshake sent. Your message wasn't sent — please retype it after the lock turns green.");
+        toast("🔐 Invitation sent. Your message is still in the box — press Enter again once the button shows 🔒.");
         return { cancel: true };
     }
 
     if (s.phase === "init-sent") {
         // Still waiting on the peer's ACK. Refuse to send plaintext.
-        toast("🔐 E2EE handshake still in progress. Wait for the lock to turn green.");
+        toast("🔐 Still waiting for your friend to accept. Press Enter again once the button shows 🔒.");
         return { cancel: true };
     }
 
     if (s.phase === "init-recvd") {
+        // A changed identity key is never accepted as a side effect of typing.
+        if (hasChangedKey(channelId, s)) {
+            toast(
+                "⚠️ Nothing was sent: your friend's identity key has changed. Click the ⚠️ button to review it.",
+                "critical"
+            );
+            return { cancel: true };
+        }
+
         // Pending invitation in an already-enabled channel (the INIT arrived
         // after the user turned the lock on, so the lock click couldn't accept
-        // it). Sending a message is the explicit accept gesture here. The typed
-        // message is discarded: as responder we can't encrypt until the peer's
-        // first encrypted message primes our sending chain.
+        // it). Sending a message is the explicit accept gesture here. The
+        // message itself has to wait: as responder we can't encrypt until the
+        // peer's first encrypted message primes our sending chain.
         const sess = await acceptInvite(channelId, s);
         if (sess) {
             const safety = settings.store.showSafetyNumberOnReady
                 ? ` Safety #: ${sess.safetyNum}.`
                 : "";
             toast(
-                `🔐 E2EE handshake accepted.${safety} ` +
-                "Your message wasn't sent — please retype it after the lock turns green.",
+                `🔐 Invitation accepted.${safety} ` +
+                "Your message is still in the box — press Enter again in a moment.",
                 "success"
             );
         }
+        return { cancel: true };
+    }
+
+    if (s.untrustedKey) {
+        toast(
+            "⚠️ Nothing was sent: your friend's identity key has changed. Click the ⚠️ button to review it.",
+            "critical"
+        );
         return { cancel: true };
     }
 
@@ -680,10 +833,13 @@ const onSend: MessageSendListener = async (channelId, msg) => {
     try {
         const plaintext = msg.content;
         const wire = await encryptForSession(s, plaintext);
+        // The ratchet advances on every send, and the advanced state has to be
+        // on disk before the message leaves: restarting from older state would
+        // seal the next message under this one's key.
+        await persistState();
         msg.content = wire;
         // Remember our own plaintext so the echoed message renders readably.
         rememberOwnPlaintext(wire, plaintext);
-        await persistSessions(); // ratchet state advances on every send
     } catch (e) {
         // Too long to fit in one Discord message. `encryptForSession` raises
         // this before touching the ratchet, so there is nothing to roll back —
@@ -710,7 +866,7 @@ const onSend: MessageSendListener = async (channelId, msg) => {
         );
         return { cancel: true };
     }
-};
+}
 
 // ------------------------------ Outgoing edit hook ------------------------------
 
@@ -760,6 +916,10 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
     const ch = ChannelStore.getChannel(channelId);
     if (!ch || !isDM(ch)) return;
 
+    // This send already failed and had its ciphertext restored. Leave it alone
+    // so Retry cannot re-send a plaintext we rendered into it.
+    if (optimistic && failedSends.has(message.id)) return;
+
     // A v1 marker: either our own pre-upgrade history or a peer who hasn't
     // updated. v2 key derivation is domain-separated from v1, so there is no
     // way to read these — but labelling them beats rendering base64, and it
@@ -775,7 +935,13 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
     // Locked vault: we can see that this is one of ours but hold no keys.
     // Render a placeholder and touch nothing — in particular do not mark
     // handshake messages processed, so they still take effect after unlocking.
+    // The placeholder overwrites the store's copy, so keep the original: it is
+    // what `replayLockedMessages` feeds back through here after the unlock.
     if (vaultLocked) {
+        if (!optimistic && message.id) {
+            lockedMessages.set(message.id, { channelId, message: { ...message } });
+            trimOldest(lockedMessages, MAX_LOCKED_MESSAGES);
+        }
         replaceContent(channelId, message, "🔐 [Locked — enter your password to read this message]");
         return;
     }
@@ -797,11 +963,7 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
     if (optimistic && fromSelf && message.id) {
         inFlightWire.delete(message.id);
         inFlightWire.set(message.id, content);
-        while (inFlightWire.size > MAX_IN_FLIGHT) {
-            const oldest = inFlightWire.keys().next().value;
-            if (oldest === undefined) break;
-            inFlightWire.delete(oldest);
-        }
+        trimOldest(inFlightWire, MAX_IN_FLIGHT);
     }
 
     /** markProcessed, but a no-op for optimistic echoes: their IDs are
@@ -859,11 +1021,9 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
                 }
                 replaceContent(
                     channelId, message,
-                    !stillPending
-                        ? "🔐 [E2EE handshake invitation — historic]"
-                        : keyChanged
-                            ? "⚠️ [E2EE handshake invitation — peer's identity key has CHANGED since you last talked! Verify the safety number out of band before accepting.]"
-                            : "🔐 [E2EE handshake invitation — click the lock to accept]"
+                    stillPending
+                        ? inviteLabel(keyChanged, current?.safetyNum ?? null)
+                        : "🔐 [E2EE handshake invitation — historic]"
                 );
                 return;
             }
@@ -878,8 +1038,9 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
             //   - abort our in-flight `init-sent` handshake and impersonate the responder
             //   - race a legitimate peer's `init-recvd` invitation by overwriting it
             // The user can reset manually (lock off → lock on) if they want to
-            // accept a fresh handshake.
-            if (current && current.phase !== "none") {
+            // accept a fresh handshake. A channel the peer reset has no session
+            // left to protect, so there an invitation is welcome.
+            if (current && current.phase !== "none" && current.phase !== "peer-reset") {
                 const reason =
                     current.phase === "ready" ? "secure channel already active" :
                     current.phase === "init-sent" ? "outgoing handshake in flight" :
@@ -903,29 +1064,26 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
             // here — that was the spam vector. The user must explicitly accept
             // (click the lock, or send a message if already enabled), which
             // runs buildAck and produces the actual ACK wire.
+            //
+            // The safety number is worked out now rather than on accept: it
+            // only needs the two identity keys, and "compare it before you
+            // accept" is advice nobody can follow if it appears afterwards.
             const pending: Session = {
+                ...emptySession(),
                 phase: "init-recvd",
                 peerIdPub,
                 peerEphPub,
-                pendingEph: null,
-                ratchet: null,
-                safetyNum: null,
-                untrustedKey: false,
+                safetyNum: await safetyNumber(identity.publicKey, peerIdPub),
             };
             sessions.set(channelId, pending);
-            await persistSessions();
+            await persistState();
             notifyStateChange();
-            replaceContent(
-                channelId, message,
-                keyChanged
-                    ? "⚠️ [E2EE handshake invitation — peer's identity key has CHANGED since you last talked! Verify the safety number out of band before accepting.]"
-                    : "🔐 [E2EE handshake invitation — click the lock to accept]"
-            );
+            replaceContent(channelId, message, inviteLabel(keyChanged, pending.safetyNum));
             if (keyChanged) {
                 toast(
-                    "⚠️ E2EE: peer wants to start a secure channel, but their identity key has " +
+                    "⚠️ E2EE: your friend wants to start a secure channel, but their identity key has " +
                     "CHANGED since you last talked. This could be a new install — or an attacker. " +
-                    "Verify the safety number out of band before accepting!",
+                    "Click the ⚠️ button to see the safety number and compare it with them first.",
                     "critical"
                 );
             } else {
@@ -956,44 +1114,39 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
                 return;
             }
             const newSession = await handleAck(identity, s.pendingEph, content);
+
+            // TOFU pin check. A changed key means whoever just answered is NOT
+            // who answered last time. The keys are derived either way, but the
+            // session is held: the new key is not pinned, the priming message
+            // is not sent and `sendEncrypted` refuses, until the user has seen
+            // the safety number and confirmed it (see `onLockClicked`). A toast
+            // alone would be gone in seconds and leave a green lock behind.
+            newSession.untrustedKey = !!newSession.peerIdPub
+                && checkPeerKey(message.author.id, newSession.peerIdPub) === "changed";
             sessions.set(channelId, newSession);
-
-            // TOFU pin check. The session is established either way (the user
-            // initiated this handshake), but a changed key means whoever just
-            // answered is NOT who answered last time — warn loudly, then pin
-            // the new key so the next change warns again.
-            const ackKeyChanged = newSession.peerIdPub
-                ? checkPeerKey(message.author.id, newSession.peerIdPub) === "changed"
-                : false;
-            if (newSession.peerIdPub) await pinPeerKey(message.author.id, newSession.peerIdPub);
-
-            // Prime the responder's sending chain. By Double Ratchet design
-            // the responder (Bob) has no sending chain until our first
-            // encrypted message reaches him and triggers his DH ratchet — so
-            // until we send something, ALL of his sends would fail. Send one
-            // encrypted message automatically so both sides can talk
-            // immediately. It decrypts to a visible "channel established"
-            // note on his end.
-            try {
-                const primeText = "🔐 Secure channel established.";
-                const primeWire = await encryptForSession(newSession, primeText);
-                rememberOwnPlaintext(primeWire, primeText);
-                sendRaw(channelId, primeWire);
-            } catch (e) {
-                log.error("Failed to send priming message", e);
-            }
-
-            await persistSessions();
+            await persistState();
             notifyStateChange();
-            replaceContent(channelId, message, "🔐 E2EE secure channel established.");
-            if (ackKeyChanged) {
+
+            if (newSession.untrustedKey) {
+                replaceContent(
+                    channelId, message,
+                    "⚠️ [E2EE invitation answered with a DIFFERENT identity key than last time. " +
+                    `Nothing will be sent until you click the ⚠️ button and confirm. Safety number: ${newSession.safetyNum}]`
+                );
                 toast(
-                    "⚠️ E2EE: secure channel established, but the peer's identity key has " +
-                    "CHANGED since you last talked. Verify the safety number " +
-                    `(${newSession.safetyNum}) out of band before trusting this channel!`,
+                    "⚠️ E2EE: your friend's identity key has CHANGED since you last talked. " +
+                    "Nothing will be sent until you click the ⚠️ button and confirm it.",
                     "critical"
                 );
-            } else if (settings.store.showSafetyNumberOnReady) {
+                await markProcessedIfReal(message.id);
+                return;
+            }
+
+            if (newSession.peerIdPub) await pinPeerKey(message.author.id, newSession.peerIdPub);
+            await sendPrime(channelId, newSession).catch(e => log.error("Failed to send priming message", e));
+
+            replaceContent(channelId, message, "🔐 E2EE secure channel established.");
+            if (settings.store.showSafetyNumberOnReady) {
                 toast(
                     `🔐 Secure channel established. Safety #: ${newSession.safetyNum}`,
                     "success"
@@ -1016,16 +1169,27 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
                 replaceContent(channelId, message, "🔐 [E2EE reset — historic]");
                 return;
             }
-            // A reset means E2EE is OFF for this DM on BOTH sides. Dropping only
-            // the session would leave the channel enabled here, which shows the
-            // 🟡 "enabled, no session" lock and makes our next typed message
-            // silently fire a fresh handshake invitation at the peer.
-            sessions.delete(channelId);
-            enabledChannels.delete(channelId);
-            await persistSessions();
-            await persistEnabled();
+            // The session is gone either way. What must NOT happen is the DM
+            // quietly going back to plaintext: a RESET proves nothing about who
+            // sent it, so anyone able to put a message into this DM could
+            // otherwise switch encryption off for us, and the next thing typed
+            // would go out in the clear. Nor should the next message silently
+            // fire a new invitation at a peer who just said no. So the channel
+            // stays enabled and closed until the user picks one of the two.
+            if (enabledChannels.has(channelId)) {
+                sessions.set(channelId, { ...emptySession(), phase: "peer-reset" });
+                replaceContent(
+                    channelId, message,
+                    "⚠️ Your friend ended the encrypted chat. Nothing can be sent here until you click the ⚠️ button and choose what to do."
+                );
+                toast("⚠️ E2EE: your friend ended the encrypted chat. Click the ⚠️ button to choose what happens next.", "critical");
+            } else {
+                // We never opted in here, so this only withdraws an invitation.
+                sessions.delete(channelId);
+                replaceContent(channelId, message, "🔐 [E2EE invitation withdrawn]");
+            }
+            await persistState();
             notifyStateChange();
-            replaceContent(channelId, message, "🔐 Peer reset the secure channel — E2EE is now off.");
             await markProcessedIfReal(message.id);
             return;
         }
@@ -1051,10 +1215,7 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
             if (fromSelf) {
                 const pt = recallOwnPlaintext(content);
                 if (pt !== undefined) {
-                    if (!optimistic) {
-                        cacheDecrypted(message.id, pt);
-                        await persistDecrypted();
-                    }
+                    if (!optimistic) cacheDecrypted(message.id, pt);
                     replaceContent(channelId, message, pt);
                 } else {
                     replaceContent(channelId, message, "🔐 [encrypted — sent]");
@@ -1067,10 +1228,10 @@ async function handleIncoming(channelId: string, message: any, optimistic = fals
                 replaceContent(channelId, message, "🔐 [no session — cannot decrypt]");
                 return;
             }
+            // Saving is left to `enqueueIncoming`, which does it once per batch
+            // instead of once per message.
             const plaintext = await decryptForSession(s, content);
             cacheDecrypted(message.id, plaintext);
-            await persistDecrypted();
-            await persistSessions();
             replaceContent(channelId, message, plaintext);
         }
     } catch (e) {
@@ -1127,19 +1288,63 @@ function isDM(ch: any): boolean {
     return ch?.type === 1;
 }
 
+function inviteLabel(keyChanged: boolean, safetyNum: string | null): string {
+    return keyChanged
+        ? "⚠️ [E2EE invitation — your friend's identity key has CHANGED since you last talked. " +
+          `Compare this safety number with them before accepting: ${safetyNum ?? "click the ⚠️ button"}]`
+        : "🔐 [E2EE handshake invitation — click the lock to accept]";
+}
+
+/** Oldest first. Snowflakes are decimal strings, so a shorter one is older. */
+function bySnowflake(a: { id: string; }, b: { id: string; }): number {
+    return a.id.length - b.id.length || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
 /**
- * Serialize all incoming-message processing per channel. handleIncoming
- * awaits crypto ops while mutating shared session state; if a LOAD batch (or
- * a LOAD racing a MESSAGE_CREATE) ran concurrently, two decrypts could read
- * the same chain key and derive wrong message keys or clobber counters.
+ * Process incoming messages in the channel's queue, in the order given.
+ *
+ * handleIncoming awaits crypto ops while mutating shared session state; if a
+ * LOAD batch (or a LOAD racing a MESSAGE_CREATE, or a send) ran concurrently,
+ * two ratchet steps could read the same chain key. The queue is shared with
+ * `onSend` and the lock button for that reason.
+ *
+ * State is saved once at the end rather than after each message. A history
+ * load can decrypt dozens of messages, and every save rewrites the whole
+ * plaintext cache.
  */
-const channelQueues = new Map<string, Promise<void>>();
-function enqueueIncoming(channelId: string, message: any, optimistic = false) {
-    const prev = channelQueues.get(channelId) ?? Promise.resolve();
-    const next = prev
-        .then(() => handleIncoming(channelId, message, optimistic))
-        .catch(err => log.error("Failed to handle incoming message", err));
-    channelQueues.set(channelId, next);
+function enqueueIncoming(channelId: string, messages: any[], optimistic = false) {
+    // Almost every message Discord dispatches is not ours; don't queue those.
+    const ours = messages.filter(m => typeof m?.content === "string" && isE2EEMessage(m.content));
+    if (ours.length === 0) return;
+
+    runExclusive(channelId, async () => {
+        for (const message of ours) {
+            await handleIncoming(channelId, message, optimistic)
+                .catch(err => log.error("Failed to handle incoming message", err));
+        }
+        if (unsavedIncoming) {
+            unsavedIncoming = false;
+            await persistState().catch(err => {
+                unsavedIncoming = true;
+                throw err;
+            });
+        }
+    }).catch(err => log.error("Failed to save E2EE state", err));
+}
+
+/** After an unlock: decrypt what arrived (and was rendered as a placeholder)
+ *  while the vault was locked. */
+function replayLockedMessages() {
+    const byChannel = new Map<string, any[]>();
+    for (const { channelId, message } of lockedMessages.values()) {
+        if (!byChannel.has(channelId)) byChannel.set(channelId, []);
+        byChannel.get(channelId)!.push(message);
+    }
+    lockedMessages.clear();
+
+    for (const [channelId, messages] of byChannel) {
+        enqueueIncoming(channelId, messages.sort(bySnowflake));
+    }
 }
 
 // ------------------------------ FluxDispatcher subscriptions ------------------------------
@@ -1164,12 +1369,11 @@ const LockIcon: IconComponent = ({ height = 20, width = 20, className }) => (
 );
 
 const LockButton: ChatBarButtonFactory = ({ channel, isMainChat }) => {
-    if (!isMainChat) return null; // skip forwarding modal etc.
-    if (!channel || !isDM(channel)) return null;
-
     // Subscribe to E2EE state changes so the icon/tooltip update the moment
     // the user toggles the lock or a handshake advances, without needing a
-    // channel switch to force a re-render.
+    // channel switch to force a re-render. Hooks come before the early returns:
+    // the same button instance can be re-rendered for a different channel, and
+    // a hook count that depends on the channel type crashes the component.
     const [, setTick] = React.useState(0);
     React.useEffect(() => {
         const fn = () => setTick(t => t + 1);
@@ -1177,8 +1381,12 @@ const LockButton: ChatBarButtonFactory = ({ channel, isMainChat }) => {
         return () => { stateSubscribers.delete(fn); };
     }, []);
 
+    if (!isMainChat) return null; // skip forwarding modal etc.
+    if (!channel || !isDM(channel)) return null;
+
     const sess = sessions.get(channel.id);
     const enabled = enabledChannels.has(channel.id);
+    const safety = sess?.safetyNum ? ` — safety #: ${sess.safetyNum}` : "";
 
     let icon = "🔓";
     let tooltip = "E2EE off — click to enable";
@@ -1187,9 +1395,15 @@ const LockButton: ChatBarButtonFactory = ({ channel, isMainChat }) => {
         // to report, and unlocking is the only action available.
         icon = "🔑";
         tooltip = "Locked — click and enter your password";
+    } else if (enabled && sess?.phase === "peer-reset") {
+        icon = "⚠️";
+        tooltip = "Your friend ended the encrypted chat — click to choose what happens next";
+    } else if (sess && (sess.untrustedKey || (sess.phase === "init-recvd" && hasChangedKey(channel.id, sess)))) {
+        icon = "⚠️";
+        tooltip = "Your friend's identity key has changed — click to review it";
     } else if (enabled && sess?.phase === "ready") {
         icon = "🔒";
-        tooltip = `E2EE active${sess.safetyNum ? ` — safety #: ${sess.safetyNum}` : ""}`;
+        tooltip = `E2EE active${safety}`;
     } else if (enabled && sess?.phase === "init-sent") {
         icon = "🟡";
         tooltip = "E2EE handshake in progress";
@@ -1197,21 +1411,39 @@ const LockButton: ChatBarButtonFactory = ({ channel, isMainChat }) => {
         // Surfaced regardless of `enabled` so a user who hasn't yet opted in
         // can still see (and choose whether to accept) an inbound invitation.
         icon = "📩";
-        tooltip = enabled
+        tooltip = (enabled
             ? "Peer requested E2EE — send a message to accept"
-            : "Peer requested E2EE — click the lock to accept";
+            : "Peer requested E2EE — click the lock to accept") + safety;
     } else if (enabled) {
         icon = "🟡";
         tooltip = "E2EE enabled — send a message to start handshake";
     }
 
     return (
-        <ChatBarButton tooltip={tooltip} onClick={() => onLockClicked(channel.id)}>
+        <ChatBarButton tooltip={tooltip} onClick={() => { onLockClicked(channel.id).catch(e => log.error("Lock click failed", e)); }}>
             <span style={{ fontSize: "1.1em" }}>{icon}</span>
         </ChatBarButton>
     );
 };
 
+/** Run a lock-button action in the channel's queue, and say so if it fails. */
+function lockAction(channelId: string, action: () => Promise<void>) {
+    runExclusive(channelId, action).catch(e => {
+        log.error("Lock action failed", e);
+        toast("🔐 That didn't work — see the console for details.", "critical");
+    });
+}
+
+/**
+ * The lock button.
+ *
+ * Three states change what leaves this computer or whom it is encrypted to,
+ * and for those the click opens a dialog instead of acting: a live session
+ * about to be turned off, a channel the peer reset, and a changed identity
+ * key. The dialog is shown outside the channel queue so messages keep flowing
+ * while it is open; the chosen action then runs inside the queue and looks at
+ * the state again, since it may have moved on in the meantime.
+ */
 async function onLockClicked(channelId: string) {
     // While locked the button is an unlock affordance and nothing else —
     // toggling E2EE would operate on empty state and destroy real sessions.
@@ -1220,41 +1452,140 @@ async function onLockClicked(channelId: string) {
         return;
     }
 
+    const s = sessions.get(channelId);
+    const enabled = enabledChannels.has(channelId);
+
+    if (enabled && s?.phase === "peer-reset") {
+        const choice = await askChoice({
+            title: "Your friend ended the encrypted chat",
+            subtitle: "Nothing can be sent in this DM until you choose what happens next.",
+            warning:
+                "This notice can be faked by someone tampering with the chat. If you weren't expecting it, " +
+                "check with your friend some other way before carrying on without encryption.",
+            choices: [
+                { id: "plain", text: "Continue without encryption", variant: "secondary" },
+                { id: "encrypt", text: "Turn encryption back on", variant: "primary" },
+            ],
+        });
+        if (choice === "encrypt") lockAction(channelId, async () => {
+            if (sessions.get(channelId)?.phase !== "peer-reset") return;
+            await startHandshake(channelId);
+            toast("🔐 Invitation sent — the button shows 🔒 once your friend accepts.");
+        });
+        if (choice === "plain") lockAction(channelId, async () => {
+            await turnOff(channelId);
+            toast("🔐 E2EE disabled for this DM. Messages here are no longer encrypted.");
+        });
+        return;
+    }
+
+    if (s && (s.untrustedKey || (s.phase === "init-recvd" && hasChangedKey(channelId, s)))) {
+        const choice = await askChoice({
+            title: "Your friend's identity key has changed",
+            subtitle:
+                "This happens when they reinstall the plugin or clear its data. " +
+                "It is also exactly what someone impersonating them would look like.",
+            warning:
+                "Compare the safety number below with your friend over a voice call or in person. " +
+                "Only continue if you both see the same digits.",
+            body: <Paragraph style={{ fontFamily: "var(--font-code)", fontSize: "1.1em" }}>{s.safetyNum}</Paragraph>,
+            choices: [
+                { id: "off", text: s.phase === "ready" ? "Turn encryption off" : "Decline", variant: "secondary" },
+                { id: "trust", text: "They match — trust this key", variant: "critical-primary" },
+            ],
+        });
+        if (choice === "trust") lockAction(channelId, () => trustChangedKey(channelId));
+        if (choice === "off") lockAction(channelId, async () => {
+            await turnOff(channelId);
+            toast("🔐 The new key was not trusted. E2EE is off for this DM.");
+        });
+        return;
+    }
+
+    if (enabled && s?.phase === "ready") {
+        const choice = await askChoice({
+            title: "Turn off encryption?",
+            subtitle:
+                "New messages in this DM will be readable by Discord again. Your friend is told, and their side " +
+                "stays closed until they confirm. Messages you have already saved stay readable.",
+            choices: [
+                { id: "keep", text: "Keep encrypted", variant: "secondary" },
+                { id: "off", text: "Turn off", variant: "critical-primary" },
+            ],
+        });
+        if (choice === "off") lockAction(channelId, async () => {
+            await turnOff(channelId);
+            toast("🔐 E2EE disabled for this DM.");
+        });
+        return;
+    }
+
+    lockAction(channelId, () => toggleLock(channelId));
+}
+
+/** The clicks that need no dialog: turning E2EE on, accepting an invitation,
+ *  and backing out of a handshake that has not produced a session yet. */
+async function toggleLock(channelId: string) {
     const pending = sessions.get(channelId);
+
     if (enabledChannels.has(channelId)) {
-        // Turn off + reset session.
-        enabledChannels.delete(channelId);
-        const had = sessions.delete(channelId);
-        await persistEnabled();
-        await persistSessions();
-        notifyStateChange();
-        if (had) sendRaw(channelId, PREFIX_RESET);
+        // These need a dialog first. If the channel got here while the click
+        // was waiting its turn, do nothing; the next click asks.
+        if (pending?.phase === "ready" || pending?.phase === "peer-reset") return;
+
+        await turnOff(channelId);
         toast(
             pending?.phase === "init-recvd"
                 ? "🔐 Handshake invitation declined."
                 : "🔐 E2EE disabled for this DM."
         );
-    } else {
-        if (!identity) return;
+        return;
+    }
+
+    if (!identity) return;
+    if (pending?.phase === "init-recvd" && hasChangedKey(channelId, pending)) return;
+
+    enabledChannels.add(channelId);
+    await persistEnabled();
+    notifyStateChange();
+    if (pending?.phase === "init-recvd") {
+        // Accept the pending invitation right away — the click IS the
+        // explicit user gesture that gates buildAck.
+        const sess = await acceptInvite(channelId, pending);
+        if (sess) {
+            const safety = settings.store.showSafetyNumberOnReady
+                ? ` Safety #: ${sess.safetyNum}.`
+                : "";
+            toast(`🔐 E2EE handshake accepted.${safety}`, "success");
+        }
+    } else if (!pending || pending.phase === "none") {
+        // Start the handshake immediately instead of waiting for (and
+        // eating) the user's first typed message.
+        await startHandshake(channelId);
+        toast("🔐 Invitation sent — the button shows 🔒 once your friend accepts.");
+    }
+}
+
+/** The user compared the safety number and accepts the peer's new identity key. */
+async function trustChangedKey(channelId: string) {
+    const s = sessions.get(channelId);
+    const peerId = getPeerUserId(channelId);
+    if (!s?.peerIdPub || !peerId) return;
+
+    if (s.phase === "init-recvd") {
         enabledChannels.add(channelId);
         await persistEnabled();
         notifyStateChange();
-        if (pending?.phase === "init-recvd") {
-            // Accept the pending invitation right away — the click IS the
-            // explicit user gesture that gates buildAck.
-            const sess = await acceptInvite(channelId, pending);
-            if (sess) {
-                const safety = settings.store.showSafetyNumberOnReady
-                    ? ` Safety #: ${sess.safetyNum}.`
-                    : "";
-                toast(`🔐 E2EE handshake accepted.${safety}`, "success");
-            }
-        } else if (!pending || pending.phase === "none") {
-            // Start the handshake immediately instead of waiting for (and
-            // eating) the user's first typed message.
-            await startHandshake(channelId);
-            toast("🔐 E2EE handshake sent — the lock turns green when the peer accepts.");
-        }
+        if (await acceptInvite(channelId, s)) toast("🔐 Invitation accepted with the new key.", "success");
+        return;
+    }
+
+    if (s.phase === "ready" && s.untrustedKey) {
+        s.untrustedKey = false;
+        await pinPeerKey(peerId, s.peerIdPub);
+        await sendPrime(channelId, s);
+        notifyStateChange();
+        toast("🔐 New key trusted. Secure channel established.", "success");
     }
 }
 
@@ -1309,7 +1640,7 @@ export default definePlugin({
         // sends the real message back. Both have to render as plaintext; only
         // the second one carries an ID worth remembering.
         const onCreate = (e: { channelId: string; message: any; optimistic?: boolean }) => {
-            enqueueIncoming(e.channelId, e.message, e.optimistic === true);
+            enqueueIncoming(e.channelId, [e.message], e.optimistic === true);
         };
         subscribe("MESSAGE_CREATE", onCreate);
 
@@ -1319,13 +1650,21 @@ export default definePlugin({
         subscribe("MESSAGE_SUCCESS", (e: { channelId: string; messageId?: string; message?: any }) => {
             if (e.messageId) inFlightWire.delete(e.messageId);
             if (e.message?.id) inFlightWire.delete(e.message.id);
-            if (e.message) enqueueIncoming(e.channelId ?? e.message.channel_id, e.message);
+            if (e.message) enqueueIncoming(e.channelId ?? e.message.channel_id, [e.message]);
         });
 
         // The send failed. Discord keeps the message around with a retry
         // affordance that re-sends whatever content the record holds, so undo
         // our plaintext rewrite before the user can click it.
+        //
+        // The ID is recorded even when there is nothing to undo yet: the
+        // rewrite of this message's optimistic echo may still be waiting in
+        // the channel queue, and `handleIncoming` checks this set so that it
+        // does not run after the fact.
         subscribe("MESSAGE_SEND_FAILED", (e: { channelId: string; messageId: string }) => {
+            failedSends.add(e.messageId);
+            trimOldest(failedSends, MAX_IN_FLIGHT);
+
             const wire = inFlightWire.get(e.messageId);
             if (!wire) return;
             inFlightWire.delete(e.messageId);
@@ -1336,19 +1675,14 @@ export default definePlugin({
         // these newest-first; process oldest-first so the ratchet mostly
         // advances in order instead of leaning on skipped-key handling.
         const onLoad = (e: { channelId: string; messages: any[] }) => {
-            const msgs = [...(e.messages ?? [])].sort((a, b) =>
-                a.id?.length !== b.id?.length
-                    ? a.id?.length - b.id?.length // snowflakes: shorter id == older
-                    : a.id < b.id ? -1 : 1
-            );
-            for (const m of msgs) enqueueIncoming(e.channelId, m);
+            enqueueIncoming(e.channelId, (e.messages ?? []).filter(m => m?.id).sort(bySnowflake));
         };
         subscribe("LOAD_MESSAGES_SUCCESS", onLoad);
 
         // Edits: re-decrypt if the cached ciphertext changed somehow (shouldn't).
         subscribe("MESSAGE_UPDATE", (e: { message: any }) => {
             if (!e.message?.channel_id) return;
-            enqueueIncoming(e.message.channel_id, e.message);
+            enqueueIncoming(e.message.channel_id, [e.message]);
         });
 
         log.info("E2EE plugin started");
@@ -1361,10 +1695,11 @@ export default definePlugin({
         fluxHandlers.length = 0;
 
         // Drop the derived vault key so disabling the plugin actually re-locks
-        // the data instead of leaving it readable until Discord restarts.
-        // `vaultLocked` resets too, so a re-enable starts from a clean prompt.
+        // the data instead of leaving it readable until Discord restarts. With
+        // the key gone a protected vault counts as locked, which is what keeps
+        // anything still in flight from saving its state unencrypted.
         vaultKey = null;
-        vaultLocked = false;
+        vaultLocked = vaultActive;
 
         log.info("E2EE plugin stopped");
     },

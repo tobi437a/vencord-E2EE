@@ -51,7 +51,9 @@ Either side:   🔐⟨E2EE-RESET v2⟩
 
 `header` is 40 bytes: 32-byte sender ratchet pubkey + 4-byte previous-chain length + 4-byte message number. `ct` is AES-GCM output (ciphertext + 16-byte auth tag). The header is bound to the AEAD as additional data.
 
-The INIT is stashed as a pending invitation and never auto-answered — the ACK is only built after an explicit user gesture, so a hostile peer can't trigger outbound traffic by spamming invitations.
+The INIT is stashed as a pending invitation and never auto-answered — the ACK is only built after an explicit user gesture, so a hostile peer can't trigger outbound traffic by spamming invitations. The safety number is computed as soon as the INIT arrives (it only needs the two identity keys), so it can be compared before accepting.
+
+RESET carries no proof of who sent it. Receiving one discards the session but does not turn E2EE off: the channel moves to a `peer-reset` phase in which every send is refused, until the user explicitly chooses to re-handshake or to continue unencrypted.
 
 ## Message frames and compression
 
@@ -121,7 +123,9 @@ This protects data at rest — a stolen disk image, a backup, another account on
 
 ### Locked state
 
-If the user dismisses the unlock prompt, the plugin runs locked: no identity, no sessions, the lock button turns 🔑, sends in E2EE channels are refused (never silently downgraded to plaintext), and nothing is written to storage. That last point matters — every in-memory map is empty while locked, so an unguarded write would serialise "no identity, no sessions, no cached messages" straight over the user's real encrypted data.
+If the user dismisses the unlock prompt, the plugin runs locked: no identity, no sessions, the lock button turns 🔑, sends in E2EE channels are refused (never silently downgraded to plaintext), and nothing is written to storage. That last point matters — every in-memory map is empty while locked, so an unguarded write would serialise "no identity, no sessions, no cached messages" straight over the user's real encrypted data. The same guard covers every other moment the stores have not been read yet, such as changing the password setting while the plugin is switched off.
+
+E2EE messages that arrive while locked are rendered as a placeholder, which overwrites Discord's copy of the ciphertext. The plugin keeps its own copy of each (up to 500) and feeds them back through the normal incoming path once the vault is unlocked, oldest first. The lock only comes off after every store has been read successfully; if one is unreadable the plugin stays locked rather than running on half-loaded state.
 
 The unlock prompt is **not awaited** during plugin start. Blocking `start()` on a modal would stall Vencord's startup, and the modal needs Discord's UI mounted to render at all. Instead the plugin marks itself locked *before* installing message hooks, then prompts asynchronously; the 🔑 button is the retry path if the prompt never appears.
 
@@ -141,7 +145,11 @@ The toggle is an `OptionType.COMPONENT`, not a `BOOLEAN`. Vencord's `BooleanSett
 
 **Safety numbers.** The first handshake is trust-on-first-use (TOFU). To defend against a hypothetical MITM (e.g. a malicious Discord), both users should compare their safety number out of band. It is shown in a toast when the session becomes ready and in the lock button's tooltip.
 
-**Key change detection.** Each peer's identity pubkey is pinned per user ID the first time a handshake completes, and survives session resets. A later handshake carrying a *different* identity key — what a MITM forcing a re-handshake looks like, and also what a peer reinstalling the plugin looks like — triggers a loud ⚠️ warning.
+**Key change detection.** Each peer's identity pubkey is pinned per user ID the first time a handshake completes, and survives session resets. A later handshake carrying a *different* identity key — what a MITM forcing a re-handshake looks like, and also what a peer reinstalling the plugin looks like — is held rather than completed. On the responder side the invitation cannot be accepted by typing, only through a dialog that shows the new safety number. On the initiator side the session keys are derived but the session is flagged `untrustedKey`: the new key is not pinned, the priming message is not sent, and sends are refused until the user confirms in the same dialog. The flag is persisted, so the ⚠️ survives a restart.
+
+**Resets fail closed.** See [Wire format](#wire-format): an unauthenticated RESET can end a session but cannot put a DM back into plaintext. Turning a live session off locally also asks for confirmation first.
+
+**One ratchet step at a time.** Everything that touches a channel's session — incoming messages, sends, lock-button actions — runs through one per-channel queue (`serial.ts`). An encrypt overlapping a decrypt is not cosmetic: the decrypt's commit rolls the sending chain back, and the next message is sealed under a message key and IV that were already used. Saves go through a single ordered writer that snapshots the sessions and the plaintext cache together and writes the plaintext first, so a session that has consumed a message key never reaches disk ahead of that message's plaintext.
 
 **Failed decryption never desyncs state.** `ratchetDecrypt` performs all ratchet steps on a working copy and commits only after the AEAD authenticates. Without this, a single corrupted or forged message whose header triggered a bogus DH ratchet would permanently break a live session.
 
@@ -149,9 +157,9 @@ The toggle is an `OptionType.COMPONENT`, not a `BOOLEAN`. Vencord's `BooleanSett
 
 **Edit blocking.** Discord edits bypass the encryption hook, so editing an encrypted message would send the new text in plaintext. Edits are blocked in E2EE channels.
 
-**Fail-closed sends.** Once a DM is E2EE-enabled, every path out of the send hook either encrypts or cancels. There is no branch that hands the message back to Discord unencrypted.
+**Fail-closed sends.** Once a DM is E2EE-enabled, every path out of the send hook either encrypts or cancels. There is no branch that hands the message back to Discord unencrypted — including errors: Vencord logs a send listener that throws and then sends the message as typed, so the hook catches everything and cancels.
 
-**Failed sends are restored.** The optimistic local echo is rewritten to plaintext for display; on `MESSAGE_SEND_FAILED` the ciphertext is put back, so Discord's retry affordance can't ship the plaintext.
+**Failed sends are restored.** The optimistic local echo is rewritten to plaintext for display; on `MESSAGE_SEND_FAILED` the ciphertext is put back, so Discord's retry affordance can't ship the plaintext. Failed IDs are remembered, so an echo that is only processed after its failure was announced is left untouched.
 
 ## Upgrading from v1
 
@@ -180,11 +188,13 @@ On first run after upgrading, the plugin migrates automatically:
 | `compress.ts` | DEFLATE wrappers used for message frames |
 | `session.ts` | Session lifecycle, handshake, wire format, framing, size accounting |
 | `vault.ts` | Password KDF and AES-GCM wrapping for encryption at rest |
+| `serial.ts` | Per-channel queue and ordered writer that keep ratchet steps and saves from overlapping |
 | `PassphraseModal.tsx` | Password prompt UI |
+| `ChoiceModal.tsx` | Confirmation dialogs (turn off, peer reset, changed key) |
 | `index.tsx` | Vencord plugin: lock button, message hooks, persistence, migration |
-| `tests/` | Test suite for the four Discord-free modules |
+| `tests/` | Test suite for the five Discord-free modules |
 
-`crypto.ts`, `compress.ts`, `session.ts` and `vault.ts` have no Vencord or Discord dependencies and could be adapted for other clients.
+`crypto.ts`, `compress.ts`, `session.ts`, `vault.ts` and `serial.ts` have no Vencord or Discord dependencies and could be adapted for other clients.
 
 ## Tests
 
@@ -199,6 +209,8 @@ Coverage focuses on the invariants that are expensive to debug in a live convers
 - byte-exact compression round-trips, including empty input, all 256 byte values, multi-chunk payloads and buffer views;
 - no unhandled rejections left behind when a stream errors;
 - a failed decryption leaves ratchet state byte-identical;
+- a send overlapping a receive reuses a message key when unserialised, and does not through the queue;
+- a save started mid-ratchet-step still writes one consistent snapshot;
 - a rejected over-long message doesn't advance the ratchet;
 - `projectedWireLength` matches real encryption output exactly;
 - out-of-order delivery, the `MAX_SKIP` boundary, and replay rejection;

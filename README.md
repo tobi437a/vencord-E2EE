@@ -29,7 +29,7 @@ Discord only ever sees a blob of gibberish. Your messages are decrypted on your 
 5. **Check the safety number matches before sending anything private.** Read it out over a voice call, or compare it in person. If both of you see the same digits, nobody is listening in. (Hover the 🔒 button any time to see it again.)
 6. That's it. Everything you type from now on is encrypted.
 
-To turn encryption off for a DM, click 🔒 again. Your friend is told, and both sides go back to normal messages.
+To turn encryption off for a DM, click 🔒 again and confirm. Your friend's button turns ⚠️ and their side stays closed — nothing can be sent — until they choose to turn encryption back on or to carry on without it. Nobody drops back to unencrypted messages without choosing to.
 
 ### Lock button states
 
@@ -37,8 +37,9 @@ To turn encryption off for a DM, click 🔒 again. Your friend is told, and both
 |---|---|
 | 🔓 | Encryption off — click to turn it on |
 | 🟡 | Invitation sent, waiting for your friend to accept |
-| 📩 | Your friend invited you — click to accept |
-| 🔒 | Encrypted — hover to see the safety number |
+| 📩 | Your friend invited you — hover to see the safety number, click to accept |
+| 🔒 | Encrypted — hover to see the safety number, click to turn off |
+| ⚠️ | Needs your decision before anything can be sent — your friend ended the encrypted chat, or their identity key changed. Click to see the options |
 | 🔑 | Your saved messages are locked — click and enter your password |
 
 ## Settings
@@ -61,6 +62,8 @@ Use a long password — a short one can be guessed by an attacker with your hard
 
 **Only one-on-one DMs.** Group DMs and server channels aren't supported.
 
+**One computer per person.** Keys and saved messages live on the computer where you set the chat up. Your phone, the browser, or a second PC will only show gibberish for that DM, and anything you send from them is not encrypted.
+
 **You can't edit encrypted messages.** Editing would send your new text unencrypted, so the plugin blocks it. Send a new message instead.
 
 **Very long messages may be rejected.** Encryption makes text bigger, and Discord caps messages at 2000 characters. The plugin compresses your text first, which usually gives you plenty of room, but if a message is too long it will tell you roughly how much to cut rather than sending it broken.
@@ -75,8 +78,10 @@ Use a long password — a short one can be guessed by an attacker with your hard
 
 **"Message too long."** Encryption adds overhead. Shorten it, or split it into two messages.
 
-**A ⚠️ warning says my friend's identity key changed.** This happens if they reinstalled the plugin or cleared their data — but it's *also* what an attacker impersonating them would look like. Before trusting the chat, compare safety numbers with them over voice or in person.
+**A ⚠️ warning says my friend's identity key changed.** This happens if they reinstalled the plugin or cleared their data — but it's *also* what an attacker impersonating them would look like. Nothing is sent while the warning is up. Click the ⚠️ button: it shows the safety number for the new key. Compare it with your friend over voice or in person, and only then choose to trust it.
 
-**Messages suddenly won't decrypt.** The two sides have got out of step. Click 🔒 to turn encryption off, then 🔓 to turn it back on and redo the setup. You'll keep the messages already saved on your computer.
+**The button turned ⚠️ and says my friend ended the encrypted chat.** They turned encryption off or declined your invitation. Click the button and pick: turn encryption back on (sends a new invitation), or continue without it. If you weren't expecting this, ask them another way first — the notice itself can be faked by someone tampering with the chat, which is exactly why the plugin won't go back to unencrypted messages on its own.
+
+**Messages suddenly won't decrypt.** The two sides have got out of step. Click 🔒 and turn encryption off, then 🔓 to turn it back on and redo the setup. You'll keep the messages already saved on your computer.
 
 **I forgot my password.** There's no way to recover it. You can clear the plugin's data in Vencord settings to start fresh, but the saved messages are gone.
